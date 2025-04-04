@@ -75,10 +75,8 @@ class Trainer:
         batch_loss, pixel_loss, auxillary_loss = 0.0, 0.0, 0.0
 
         for i, data in enumerate(loop):
-            _states, _static, outputs = self._extract_data_instance(data)
-
             self._optimizer.zero_grad()
-            out = self.forward(_states, _static, outputs)
+            out = self.forward(data)
             loss = out['loss']
             loss.backward()
 
@@ -107,18 +105,19 @@ class Trainer:
         batch_vloss, pixel_vloss, auxillary_vloss = 0.0, 0.0, 0.0
 
         for i, data in enumerate(valid_loader):
-            _states, _static, outputs = self._extract_data_instance(data)
 
             with torch.no_grad():
-                out = self.forward(_states, _static, outputs)
+                out = self.forward(data)
                 batch_vloss += out['loss'].item()
                 pixel_vloss += out['loss_pixel'].item()
                 auxillary_vloss += out['loss_auxillary'].item()
 
         return batch_vloss / (i + 1), pixel_vloss / (i + 1), auxillary_vloss / (i + 1)
 
-    def forward(self, _states, _static, outputs):
+    def forward(self, data):
         
+        _states, _static, outputs = self._extract_data_instance(data)
+
         preds = self.model(_states, _static)
 
         loss_pixel = self.loss_fn(preds, outputs)
@@ -130,10 +129,13 @@ class Trainer:
 
         total_loss = loss_pixel + loss_reg
         return {
-            'preds': preds,
             'loss': total_loss,
             'loss_pixel': loss_pixel.detach(),
             'loss_auxillary': loss_reg.detach(),
+            'preds': preds.detach().cpu(),
+            'outputs': outputs.detach().cpu(),
+            'static': _static.detach().cpu(),
+            'states': _states.detach().cpu()
         }
 
     def train(self, train_loader, valid_loader, path_to_model, ckpt_epoch=5):
@@ -185,18 +187,17 @@ class Trainer:
         loop = tqdm(test_loader) if self.verbose == 1 else test_loader
 
         for i, data in enumerate(loop):
-            _states, _static, outputs = self._extract_data_instance(data)
 
             with torch.no_grad():
-                out = self.forward(_states, _static, outputs)
+                out = self.forward(data)
 
             batch_loss += out['loss'].item()
             pixel_loss += out['loss_pixel'].item()
             aux_loss += out['loss_auxillary'].item()
 
-            preds.append(out['preds'].cpu())
-            states.append(outputs.cpu())
-            static.append(_static.cpu())
+            preds.append(out['preds'])
+            states.append(out['outputs'])
+            static.append(out['static'])
 
             if self.verbose == 1:
                 loop.set_description("Testing")
@@ -213,4 +214,44 @@ class Trainer:
             'test_loss': batch_loss / (i + 1),
             'pixel_loss': pixel_loss / (i + 1),
             'aux_loss': aux_loss / (i + 1)
+        }
+
+
+class Trainer_RUNET(Trainer):
+    def __init__(self, model, train_config, wells=None, **kwargs):
+        super().__init__(model, train_config, **kwargs)
+        self.wells = wells or [(42, 42, 16), (42, 42, 17), (27, 27, 16), (27, 27, 17)]
+
+    def _extract_data_instance(self, data):
+        _s, _p, _m = data # (s, p) ~ (B, T + 1, X, Y, Z), (m) ~ (B, 1, X, Y, Z)
+        _u = torch.zeros_like(_s[:, 1:]) # Placeholder for the control input (B, T, X, Y, Z)
+        for ix, iy, iz in self.wells:
+            _u[..., ix, iy, iz] = 1
+        contrl = _u[:, :, None].to(self.device) # Control input (B, T, 1, X, Y, Z)
+        _states = torch.cat((_s[:, [0]], _p[:, [0]]), dim=1).to(self.device) # initial state
+        _static = _m.to(self.device)
+        outputs = torch.cat((_s[:, 1:][:, :, None], _p[:, 1:][:, :, None]), dim=2).to(self.device)
+        return contrl, _states, _static, outputs
+
+    def forward(self, data):
+        contrl, _states, _static, outputs = self._extract_data_instance(data)
+
+        preds = self.model(contrl, _states, _static)
+
+        loss_pixel = self.loss_fn(preds, outputs)
+
+        if self.regularizer is not None:
+            loss_reg = self.regularizer_weight * self.regularizer(preds, outputs)
+        else:
+            loss_reg = torch.tensor(0.0, device=self.device)
+
+        total_loss = loss_pixel + loss_reg
+        return {
+            'loss': total_loss,
+            'loss_pixel': loss_pixel.detach(),
+            'loss_auxillary': loss_reg.detach(),
+            'preds': preds.detach().cpu(),
+            'outputs': outputs.detach().cpu(),
+            'static': _static.detach().cpu(),
+            'states': _states.detach().cpu()
         }
