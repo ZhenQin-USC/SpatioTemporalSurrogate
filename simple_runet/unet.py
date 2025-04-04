@@ -333,6 +333,7 @@ class SimpleRUNet(nn.Module):
         preds = torch.stack(output_seq, dim=1)
         return preds
 
+
 class RUNet(nn.Module):
     def __init__(self, 
                  filters: int, 
@@ -405,11 +406,11 @@ class RUNet(nn.Module):
                                )
             output_seq.append(out)
 
-        outputs = torch.stack(output_seq, dim=1)
-        return outputs, outputs
+        preds = torch.stack(output_seq, dim=1)
+        return preds
 
 
-class RUNetA(RUNet):
+class RUNetParallel(RUNet):
     """
     A parallel variant of RUNet where control encoder and decoder operate independently,
     useful when control signal needs to be disentangled or multi-streamed.
@@ -445,7 +446,7 @@ class RUNetA(RUNet):
         u_enc1, u_enc2, u_enc3, u_enc4 = self.u_encoder(contrl.reshape(B * T, C, X, Y, Z)) 
         u4s = u4.reshape(B, T, *u_enc4.shape[1:]) # (B, T, C, X, Y, Z)
 
-        # ConvLSTM:
+        # Conv-LSTM for latent dynamics:
         latent_seq = []
         for step in range(T):
             u4 = u4s[:, step, ...]
@@ -460,13 +461,13 @@ class RUNetA(RUNet):
 
         latent_seq = torch.stack(latent_seq, dim=1)  # (B, T, C, X, Y, Z)
 
-        outputs = self.parallel_x_decoder(latent_seq,  # (B, T, C, X, Y, Z)
-                                          [x_enc1, x_enc2, x_enc3, x_enc4],
-                                          [u_enc1, u_enc2, u_enc3, u_enc4])
+        preds = self.parallel_decoder(latent_seq,  # (B, T, C, X, Y, Z)
+                                      [x_enc1, x_enc2, x_enc3, x_enc4],
+                                      [u_enc1, u_enc2, u_enc3, u_enc4])
         
-        return outputs
+        return preds
     
-    def parallel_x_decoder(self, latent_seq, x_encs, u_encs):
+    def parallel_decoder(self, latent_seq, x_encs, u_encs):
         B, T, C, X, Y, Z = latent_seq.shape
 
         x = latent_seq.reshape(B * T, C, X, Y, Z)
@@ -474,9 +475,7 @@ class RUNetA(RUNet):
         x_encs_repeated = [torch.repeat_interleave(enc, repeats=T, dim=0) 
                            for i, enc in enumerate(x_encs)]
 
-        x = self.x_dec_res(x) # (B*T, C, X, Y, Z)
-
-        out = self.x_decoder(x, x_encs_repeated, u_encs) # (B*T, C, X, Y, Z)
+        out = self.decoder(x, x_encs_repeated, u_encs) # (B*T, C, X, Y, Z)
 
         output_seq = out.reshape(B, T, *out.shape[1:])
         return output_seq
