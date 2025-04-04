@@ -464,7 +464,7 @@ class RUNetParallel(RUNet):
 
         # Contrl Encoder: (B, T, C, X, Y, Z) -> (B*T, C, X, Y, Z)
         u_enc1, u_enc2, u_enc3, u_enc4 = self.u_encoder(contrl.reshape(B * T, C, X, Y, Z)) 
-        u4s = u4.reshape(B, T, *u_enc4.shape[1:]) # (B, T, C, X, Y, Z)
+        u4s = u_enc4.reshape(B, T, *u_enc4.shape[1:]) # (B, T, C, X, Y, Z)
 
         # Conv-LSTM for latent dynamics:
         latent_seq = []
