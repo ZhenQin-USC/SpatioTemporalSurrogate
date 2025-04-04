@@ -1,17 +1,13 @@
-
 import torch
 import torch.nn as nn
-import numpy as np
-from tqdm import tqdm
 from os.path import join
-from torch.optim.lr_scheduler import StepLR
 from typing import Callable, List, Optional, Sequence, Tuple, Union
 
 
 class ConvLSTM3DCell(nn.Module):
 
     def __init__(self, input_dim, hidden_dim, 
-                 kernel_size=3, padding_mode='zeros', bias=True, 
+                 kernel_size=3, padding=1, padding_mode='zeros', bias=True, 
                  ):
         """
         Initialize ConvLSTM cell.
@@ -39,17 +35,17 @@ class ConvLSTM3DCell(nn.Module):
         self.input_conv = nn.Conv3d(in_channels=self.input_dim,
                                     out_channels=4*self.hidden_dim,
                                     kernel_size=self.kernel_size,
-                                    stride=(1,1,1),
-                                    padding='same',
+                                    padding=padding,
                                     padding_mode=self.padding_mode,
+                                    stride=(1,1,1),
                                     bias=self.bias)
         
         self.recurrent_conv = nn.Conv3d(in_channels=self.hidden_dim, 
                                         out_channels=4*self.hidden_dim,
                                         kernel_size=self.kernel_size, 
-                                        stride=(1,1,1),
-                                        padding='same',
+                                        padding=padding,
                                         padding_mode=self.padding_mode,
+                                        stride=(1,1,1),
                                         bias=False)
         
         self.recurrent_activation = nn.Sigmoid()
@@ -109,7 +105,7 @@ class Conv_block(nn.Module):
 
 class ResConv_block(nn.Module):
 
-    def __init__(self, in_channels, kernel_size=3, padding=1, act_layer: Callable = nn.GELU, 
+    def __init__(self, in_channels, kernel_size=3, padding=1, 
                  stride=1, padding_mode='zeros', norm_type='group', num_groups=None):
         
         super(ResConv_block, self).__init__()
@@ -117,15 +113,15 @@ class ResConv_block(nn.Module):
         self.conv0 = nn.Conv3d(in_channels=in_channels,
                                out_channels=in_channels,
                                kernel_size=kernel_size,
-                               stride=stride,
                                padding=padding,
+                               stride=stride,
                                padding_mode=padding_mode)
         
         self.conv1 = nn.Conv3d(in_channels=in_channels,
                                out_channels=in_channels,
                                kernel_size=kernel_size,
-                               stride=stride,
                                padding=padding,
+                               stride=stride,
                                padding_mode=padding_mode)
 
         if norm_type == 'batch': 
@@ -139,7 +135,7 @@ class ResConv_block(nn.Module):
             self.norm1 = nn.GroupNorm(num_groups=num_groups, 
                                       num_channels=in_channels)
         
-        self.nonlinear = act_layer()
+        self.nonlinear = nn.ReLU()
 
     def forward(self, x):
         a = self.conv0(x)
@@ -151,16 +147,18 @@ class ResConv_block(nn.Module):
 
 class Deconv_block(nn.Module):
     def __init__(self, scale_factor, in_channels, out_channels, kernel_size=3, padding=0, 
-                 act_layer: Callable = nn.GELU, stride=1, padding_mode='zeros', 
-                 norm_type='group', num_groups=None):
-        
+                 stride=1, padding_mode='reflect', norm_type='group', num_groups=None):
         super(Deconv_block, self).__init__()
+        if isinstance(scale_factor, list):
+            scale_factor = tuple(scale_factor)
+        elif not isinstance(scale_factor, (int, tuple)):
+            raise ValueError("scale_factor must be an int, tuple, or list.")
+
         self.deconv = nn.Upsample(scale_factor=scale_factor)
-        self.padding = nn.ReflectionPad3d(padding)
         self.conv = nn.Conv3d(in_channels=in_channels,
                               out_channels=out_channels,
                               kernel_size=kernel_size,
-                              padding=0,
+                              padding=padding,
                               stride=stride,
                               padding_mode=padding_mode)
         if norm_type == 'batch': 
@@ -170,16 +168,23 @@ class Deconv_block(nn.Module):
                 num_groups = out_channels
             self.norm = nn.GroupNorm(num_groups=num_groups, 
                                      num_channels=out_channels)
-        self.nonlinear = act_layer()
+        self.nonlinear = nn.ReLU()
 
     def forward(self, x):
-        x = self.padding(self.deconv(x))
+        x = self.deconv(x)
         x = self.norm(self.conv(x))
         return self.nonlinear(x)
 
 
 class Encoder(nn.Module):
-    def __init__(self, ninputs, filters=16, norm_type='group', num_groups=4, strides=None):
+    def __init__(self, 
+                 ninputs, 
+                 filters=16, 
+                 norm_type='group', 
+                 num_groups=4, 
+                 kernel_size=3, 
+                 padding=1, 
+                 strides=None):
         
         super(Encoder, self).__init__()
 
@@ -188,24 +193,23 @@ class Encoder(nn.Module):
         else:
             stride0, stride1 = strides
 
-        self.conv = nn.Conv3d(ninputs, 1*filters, 
-                              kernel_size=3, padding=1, stride=1)
+        self.conv = nn.Conv3d(ninputs, 1*filters, kernel_size=kernel_size, padding=padding, stride=1)
         
         self.conv0 = Conv_block(
-            in_channels=1*filters, out_channels=2*filters, kernel_size=3, 
-            padding=1, stride=stride0, norm_type=norm_type, num_groups=num_groups)
+            in_channels=1*filters, out_channels=2*filters, kernel_size=kernel_size, 
+            padding=padding, stride=stride0, norm_type=norm_type, num_groups=num_groups)
         
         self.conv1 = Conv_block(
-            in_channels=2*filters, out_channels=2*filters, kernel_size=3, 
-            padding=1, stride=1, norm_type=norm_type, num_groups=num_groups)
+            in_channels=2*filters, out_channels=2*filters, kernel_size=kernel_size, 
+            padding=padding, stride=1, norm_type=norm_type, num_groups=num_groups)
         
         self.conv2 = Conv_block(
-            in_channels=2*filters, out_channels=4*filters, kernel_size=3, 
-            padding=1, stride=stride1, norm_type=norm_type, num_groups=num_groups)
+            in_channels=2*filters, out_channels=4*filters, kernel_size=kernel_size, 
+            padding=padding, stride=stride1, norm_type=norm_type, num_groups=num_groups)
         
         self.conv3 = Conv_block(
-            in_channels=4*filters, out_channels=4*filters, kernel_size=3, 
-            padding=1, stride=1, norm_type=norm_type, num_groups=num_groups)
+            in_channels=4*filters, out_channels=4*filters, kernel_size=kernel_size, 
+            padding=padding, stride=1, norm_type=norm_type, num_groups=num_groups)
 
 
     def forward(self, inputs):
@@ -218,8 +222,14 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, noutputs, filters=16, norm_type='group', num_groups=4, 
-                 with_control=False, strides=None):
+    def __init__(self, noutputs, 
+                 filters=16, 
+                 norm_type='group', 
+                 num_groups=4, 
+                 kernel_size=3, 
+                 padding=1, 
+                 with_control=False, 
+                 strides=None):
         
         super(Decoder, self).__init__()
         if strides == None:
@@ -235,23 +245,23 @@ class Decoder(nn.Module):
 
         self.deconv4 = Deconv_block(
             1, in_channels=coeff*4*filters, out_channels=4*filters, 
-            kernel_size=3, padding=1, norm_type=norm_type, num_groups=num_groups)
+            kernel_size=kernel_size, padding=padding, norm_type=norm_type, num_groups=num_groups)
         
         self.deconv3 = Deconv_block(
             stride0, in_channels=coeff*4*filters, out_channels=2*filters, 
-            kernel_size=3, padding=1, norm_type=norm_type, num_groups=num_groups)
+            kernel_size=kernel_size, padding=padding, norm_type=norm_type, num_groups=num_groups)
         
         self.deconv2 = Deconv_block(
             1, in_channels=coeff*2*filters, out_channels=2*filters, 
-            kernel_size=3, padding=1, norm_type=norm_type, num_groups=num_groups)
+            kernel_size=kernel_size, padding=padding, norm_type=norm_type, num_groups=num_groups)
         
         self.deconv1 = Deconv_block(
             stride1, in_channels=coeff*2*filters, out_channels=1*filters, 
-            kernel_size=3, padding=1, norm_type=norm_type, num_groups=num_groups)
+            kernel_size=kernel_size, padding=padding, norm_type=norm_type, num_groups=num_groups)
         
-        self.conv = nn.Conv3d(1*filters, noutputs, kernel_size=3, padding=1, stride=1)
+        self.conv = nn.Conv3d(1*filters, noutputs, kernel_size=kernel_size, padding=padding, stride=1)
         
-    def forward(self, x, x_enc, u_enc=None):
+    def forward(self, x, x_enc, u_enc):
         x1, x2, x3, x4 = x_enc
         if self.with_control:
             u1, u2, u3, u4 = u_enc
@@ -348,13 +358,18 @@ class RUNet(nn.Module):
                  ):
         
         super().__init__()
-        ninputs, ncontrols, noutputs = units
+        nstatic, ncontrols, noutputs = units
         self.with_control = with_control
         self.with_states = with_states
-        self.x_encoder = Encoder(ninputs, filters=filters, norm_type=norm_type, 
+
+        self.x_encoder = Encoder(nstatic+noutputs, filters=filters, norm_type=norm_type, 
                                  kernel_size=kernel_size, padding=padding, 
                                  num_groups=num_groups, strides=strides)
         
+        self.m_encoder = Encoder(nstatic, filters=filters, norm_type=norm_type, 
+                                 kernel_size=kernel_size, padding=padding, 
+                                 num_groups=num_groups, strides=strides)
+
         self.u_encoder = Encoder(ncontrols, filters=filters, norm_type=norm_type, 
                                  kernel_size=kernel_size, padding=padding, 
                                  num_groups=num_groups, strides=strides)
@@ -363,12 +378,14 @@ class RUNet(nn.Module):
         self.resnet1 = ResConv_block(4*filters, kernel_size=kernel_size, padding=padding, norm_type=norm_type, num_groups=num_groups)
         self.resnet2 = ResConv_block(4*filters, kernel_size=kernel_size, padding=padding, norm_type=norm_type, num_groups=num_groups)
         self.resnet3 = ResConv_block(4*filters, kernel_size=kernel_size, padding=padding, norm_type=norm_type, num_groups=num_groups)
+        
         factor = 2 if with_states else 1
         self.x_conv  = Conv_block(in_channels=factor*4*filters, out_channels=4*filters, 
                                   kernel_size=kernel_size, padding=padding, stride=1,
                                   norm_type=norm_type, num_groups=num_groups)
 
         self.convlstm = ConvLSTM3DCell(4*filters, 4*filters, kernel_size=kernel_size, padding=padding)
+
         self.decoder  = Decoder(noutputs, filters=filters, with_control=with_control, 
                                 kernel_size=kernel_size, padding=padding, 
                                 norm_type=norm_type, num_groups=num_groups, strides=strides)
@@ -380,6 +397,8 @@ class RUNet(nn.Module):
         
         # Encoder:
         x_enc1, x_enc2, x_enc3, x_enc4 = self.x_encoder(states)
+        m_enc1, m_enc2, m_enc3, m_enc4 = self.m_encoder(_static)
+
         # ResNet After Encoder:
         x4 = self.resnet0(x_enc4)
         x4 = self.resnet1(x4)
@@ -401,7 +420,7 @@ class RUNet(nn.Module):
             x = self.resnet2(x)
             x = self.resnet3(x)
             out = self.decoder(x, 
-                               [x_enc1, x_enc2, x_enc3, x_enc4],
+                               [m_enc1, m_enc2, m_enc3, m_enc4],
                                [u_enc1, u_enc2, u_enc3, u_enc4]
                                )
             output_seq.append(out)
@@ -436,6 +455,7 @@ class RUNetParallel(RUNet):
 
         # Encoder:
         x_enc1, x_enc2, x_enc3, x_enc4 = self.x_encoder(states)
+        m_enc1, m_enc2, m_enc3, m_enc4 = self.m_encoder(_static)
 
         # ResNet After Encoder:
         x4 = self.resnet0(x_enc4)
@@ -462,18 +482,18 @@ class RUNetParallel(RUNet):
         latent_seq = torch.stack(latent_seq, dim=1)  # (B, T, C, X, Y, Z)
 
         preds = self.parallel_decoder(latent_seq,  # (B, T, C, X, Y, Z)
-                                      [x_enc1, x_enc2, x_enc3, x_enc4],
+                                      [m_enc1, m_enc2, m_enc3, m_enc4],
                                       [u_enc1, u_enc2, u_enc3, u_enc4])
         
         return preds
     
-    def parallel_decoder(self, latent_seq, x_encs, u_encs):
+    def parallel_decoder(self, latent_seq, m_encs, u_encs):
         B, T, C, X, Y, Z = latent_seq.shape
 
         x = latent_seq.reshape(B * T, C, X, Y, Z)
 
         x_encs_repeated = [torch.repeat_interleave(enc, repeats=T, dim=0) 
-                           for i, enc in enumerate(x_encs)]
+                           for i, enc in enumerate(m_encs)]
 
         out = self.decoder(x, x_encs_repeated, u_encs) # (B*T, C, X, Y, Z)
 
