@@ -12,6 +12,7 @@ import os
 import json
 from torch.utils.data import Dataset, DataLoader
 import psutil
+from kornia.contrib import distance_transform
 
 
 class RSE_loss(object):
@@ -88,6 +89,77 @@ class Dataset_Task4(Dataset):
         perm = torch.nn.functional.pad(perm, pad=(0,0,2,2,2,2), mode='constant', value=0)
 
         return plume, press, perm
+
+
+class Dataset_Task4_with_Boundary_Mask(Dataset_Task4):
+    def __init__(self, folders, root_to_data, device, threshold = 1e-2, num_years=5, interval=1, total_step=61, dx=2, split_index=None):
+        super().__init__(folders, root_to_data, num_years=num_years, interval=interval, total_step=total_step,
+                         dx=dx, split_index=split_index)
+        self.threshold = threshold
+        self.device = device
+        self.map = self._create_signed_distance_map()
+
+    def _create_signed_distance_map(self):
+        # Step 1: create binary mask
+        B, T, X, Y, Z = self.s.shape
+        s_reshaped = self.s.permute(0, 1, 4, 2, 3)  # (B, T, Z, X, Y)
+        s_reshaped = s_reshaped.reshape(B, T * Z, X, Y)  # (B, T*Z, X, Y)
+        image = s_reshaped.to(self.device)  # (B, T*Z, X, Y)
+        bin_mask = (image >= self.threshold).float()
+
+        # Step 2: compute unsigned distance maps
+        phi_in = distance_transform(1.0 - bin_mask)  # outside: distance to foreground
+        phi_out  = distance_transform(bin_mask)        # inside: distance to background
+
+        # Step 3: combine into signed distance map
+        signed_phi = phi_out.clone()
+        signed_phi[bin_mask.bool()] = -phi_in[bin_mask.bool()]
+
+        # Step 4: reshape to original dimensions
+        signed_dist_map = signed_phi.reshape(B, T, Z, X, Y)  # (B, T, Z, X, Y)
+        signed_dist_map = signed_dist_map.permute(0, 1, 3, 4, 2)  # (B, T, X, Y, Z)
+
+        return signed_dist_map
+
+    def __getitem__(self, index):
+        sample = self.s[index], self.p[index], self.m[index], self.map[index]
+        return sample
+
+
+class Dataset_Task4_with_Contour_Mask(Dataset_Task4):
+    def __init__(self, folders, root_to_data, device, thresholds = [1e-2], num_years=5, interval=1, total_step=61, dx=2, split_index=None):
+        super().__init__(folders, root_to_data, num_years=num_years, interval=interval, total_step=total_step,
+                         dx=dx, split_index=split_index)
+        self.thresholds = thresholds
+        self.device = device
+        maps = [self._create_signed_distance_map(threshold) for threshold in self.thresholds]
+        self.map = torch.cat(maps, dim=-1)  
+
+    def _create_signed_distance_map(self, threshold):
+        # Step 1: create binary mask
+        B, T, X, Y, Z = self.s.shape
+        s_reshaped = self.s.permute(0, 1, 4, 2, 3)  # (B, T, Z, X, Y)
+        s_reshaped = s_reshaped.reshape(B, T * Z, X, Y)  # (B, T*Z, X, Y)
+        image = s_reshaped.to(self.device)  # (B, T*Z, X, Y)
+        bin_mask = (image >= threshold).float()
+
+        # Step 2: compute unsigned distance maps
+        phi_in = distance_transform(1.0 - bin_mask)  # outside: distance to foreground
+        phi_out  = distance_transform(bin_mask)        # inside: distance to background
+
+        # Step 3: combine into signed distance map
+        signed_phi = phi_out.clone()
+        signed_phi[bin_mask.bool()] = -phi_in[bin_mask.bool()]
+
+        # Step 4: reshape to original dimensions
+        signed_dist_map = signed_phi.reshape(B, T, Z, X, Y)  # (B, T, Z, X, Y)
+        signed_dist_map = signed_dist_map.permute(0, 1, 3, 4, 2)  # (B, T, X, Y, Z)
+
+        return signed_dist_map
+
+    def __getitem__(self, index):
+        sample = self.s[index], self.p[index], self.m[index], self.map[index]
+        return sample
 
 
 def load_data(path_to_data, p_postprocess=None):
