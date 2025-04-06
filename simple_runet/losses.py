@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import kornia 
 from typing import (Union, Optional, Dict, List, Tuple)
 from .lpips import LPIPS
 
@@ -166,3 +167,108 @@ class PerceptualLoss(nn.Module):
         return torch.mean(loss)
 
 
+class SSIMLoss(nn.Module):
+
+    def __init__(self, window_size, max_val=1.0, eps=1e-12, reduction='mean', padding='same', mode='both'):
+        """
+        Parameters:
+        - window_size: Size of the 3D SSIM window
+        - max_val: Normalization value of data
+        - reduction: 'mean', 'sum', or 'none'
+        - mode: 'both', 'pressure', or 'saturation'
+        """
+        super().__init__()
+        self.window_size = window_size
+        self.max_val = max_val
+        self.eps = eps
+        self.reduction = reduction
+        self.padding = padding
+        assert mode in ['both', 'pressure', 'saturation'], "mode must be 'both', 'pressure', or 'saturation'"
+        self.mode = mode
+
+    def __call__(self, preds, trues):
+        """
+        Computes the SSIM loss between predictions and targets.
+
+        Parameters:
+        - preds: Predicted outputs. (B, T, 2*F, X, Y, Z) = [p_trues || s_trues]
+        - trues: Ground truth outputs. (B, T, 2*F, X, Y, Z) = [p_preds || s_preds]
+
+        Returns:
+        - SSIM loss value.
+        """
+        B, T, X, Y, Z = trues.size(0), trues.size(1), trues.size(3), trues.size(4), trues.size(5)
+
+        # Chunk into [primary || secondary]
+        p_trues, s_trues = torch.chunk(trues, chunks=2, dim=2)  # (B, T, F, X, Y, Z)
+        p_preds, s_preds = torch.chunk(preds, chunks=2, dim=2)  # (B, T, F, X, Y, Z)
+
+        F = p_trues.size(2)  # Number of frames
+
+        # Merge T and F into channel dimension
+        p_trues = p_trues.view(B, T * F, X, Y, Z)
+        s_trues = s_trues.view(B, T * F, X, Y, Z)
+        p_preds = p_preds.view(B, T * F, X, Y, Z)
+        s_preds = s_preds.view(B, T * F, X, Y, Z)
+
+        # Selectively compute SSIM
+        losses = []
+        if self.mode in ['both', 'pressure']:
+            p_ssim = kornia.losses.ssim3d_loss(
+                p_preds, p_trues,
+                window_size=self.window_size,
+                max_val=self.max_val,
+                reduction=self.reduction
+            )
+            losses.append(p_ssim)
+
+        if self.mode in ['both', 'saturation']:
+            s_ssim = kornia.losses.ssim3d_loss(
+                s_preds, s_trues,
+                window_size=self.window_size,
+                max_val=self.max_val,
+                reduction=self.reduction
+            )
+            losses.append(s_ssim)
+
+        return sum(losses) / len(losses)
+
+
+class PerceptualLoss3D(nn.Module):
+    """
+    Wrapper for perceptual loss that allows for the use of different perceptual loss functions.
+    """
+    def __init__(self, device, num_img_for_perceptual: int = 16):
+        super().__init__()
+        self._perceptual_loss = PerceptualLoss(spatial_dims=2, network_type="vgg").to(device)
+        self.num_img_for_perceptual = num_img_for_perceptual
+
+    def __call__(self, preds, trues):
+        """
+        Computes the perceptual loss between predictions and targets.
+
+        Parameters:
+        - preds: Predicted outputs. (B, T, 2*F, X, Y, Z) = [p_trues || s_trues]
+        - trues: Ground truth outputs. (B, T, 2*F, X, Y, Z) = [p_preds || s_preds]
+
+        Returns:
+        - Perceptual loss value.
+        """
+        B, T, X, Y, Z = trues.size(0), trues.size(1), trues.size(3), trues.size(4), trues.size(5)
+
+        p_trues, s_trues = torch.chunk(trues, chunks=2, dim=2)  # (B, T, F, X, Y, Z)
+        p_preds, s_preds = torch.chunk(preds, chunks=2, dim=2)  # (B, T, F, X, Y, Z)
+        
+        p_trues_reshaped = p_trues.permute(0, -1, 1, 2, 3, 4).contiguous().view(-1, 1, X, Y) # (B*Z*T*F, X, Y)
+        p_preds_reshaped = p_preds.permute(0, -1, 1, 2, 3, 4).contiguous().view(-1, 1, X, Y)
+        s_trues_reshaped = s_trues.permute(0, -1, 1, 2, 3, 4).contiguous().view(-1, 1, X, Y)
+        s_preds_reshaped = s_preds.permute(0, -1, 1, 2, 3, 4).contiguous().view(-1, 1, X, Y)
+
+        total_images = p_trues_reshaped.size(0)
+        indices = torch.randperm(total_images)[:self.num_img_for_perceptual]
+
+        p_ploss = self._perceptual_loss(p_trues_reshaped[indices], p_preds_reshaped[indices])
+
+        s_ploss = self._perceptual_loss(s_trues_reshaped[indices], s_preds_reshaped[indices])
+        
+        return p_ploss, s_ploss
