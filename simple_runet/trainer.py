@@ -311,3 +311,41 @@ class Trainer_RUNET(Trainer): # Trainer for RUNET models
             'states': states.detach().cpu()
         }
 
+
+
+class Trainer_RUNET_2D(Trainer): # Trainer for 2D Dataset
+    def __init__(self, model, train_config, wells=None, **kwargs):
+        super().__init__(model, train_config, **kwargs)
+
+    def _extract_data_instance(self, data):
+        inputs, outputs = data
+        contrl, states, static = inputs
+        contrl = contrl.to(self.device)
+        states = states.to(self.device)
+        static = static.to(self.device)
+        outputs = outputs.to(self.device)
+        return contrl, states, static, outputs
+
+    def forward(self, data):
+        contrl, states, static, outputs = self._extract_data_instance(data)
+
+        preds = self.model(contrl, states, static)
+
+        loss_pixel = self.loss_fn(preds, outputs)
+
+        if self.regularizer is not None:
+            loss_reg = self.regularizer_weight * self.regularizer(preds, outputs)
+        else:
+            loss_reg = torch.tensor(0.0, device=self.device)
+
+        total_loss = loss_pixel + loss_reg
+        return {
+            'loss': total_loss,
+            'loss_pixel': loss_pixel.detach(),
+            'loss_auxillary': loss_reg.detach(),
+            'preds': preds.detach().cpu(),
+            'outputs': outputs.detach().cpu(),
+            'static': static.detach().cpu(),
+            'states': states.detach().cpu()
+        }
+
