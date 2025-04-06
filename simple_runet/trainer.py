@@ -296,11 +296,11 @@ class Trainer_RUNET(Trainer): # Trainer for RUNET models
         loss_pixel = self.loss_fn(preds, outputs)
 
         if self.regularizer is not None:
-            loss_reg = self.regularizer_weight * self.regularizer(preds, outputs)
+            loss_reg = self.regularizer(preds, outputs)
         else:
             loss_reg = torch.tensor(0.0, device=self.device)
 
-        total_loss = loss_pixel + loss_reg
+        total_loss = loss_pixel + self.regularizer_weight * loss_reg
         return {
             'loss': total_loss,
             'loss_pixel': loss_pixel.detach(),
@@ -310,7 +310,6 @@ class Trainer_RUNET(Trainer): # Trainer for RUNET models
             'static': static.detach().cpu(),
             'states': states.detach().cpu()
         }
-
 
 
 class Trainer_RUNET_2D(Trainer): # Trainer for 2D Dataset
