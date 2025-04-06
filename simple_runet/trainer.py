@@ -1,9 +1,58 @@
 import torch
 import torch.nn as nn
-from torch.optim.lr_scheduler import StepLR
 import numpy as np
+from torch.optim.lr_scheduler import StepLR
 from tqdm import tqdm
 from os.path import join
+from torch.utils.data import Dataset
+
+
+class Dataset(Dataset):
+    def __init__(self, folders, root_to_data, num_years=5, interval=1, total_step=61, dx=2, split_index=None):
+        self.folders = folders
+        self.dx = dx
+        self.split_index = split_index
+        self.total_step = total_step
+        self.interval = interval
+        self.num_steps = num_years * (4 // interval)
+        self.root_to_data = root_to_data
+        self.step_index = np.array(range(0, self.total_step, self.interval))[:self.num_steps+1]
+        self.s, self.p, self.m = self._dataloader()
+        self.len = self.m.shape[0]
+
+    def __getitem__(self, index):
+        sample = self.s[index], self.p[index], self.m[index]
+        return sample
+
+    def __len__(self):
+        return self.len
+
+    def _dataloader(self):
+        
+        plume, press, perm = [], [], []
+        
+        for folder in self.folders:
+            path_to_data = join(self.root_to_data, folder)
+            s = torch.load(join(path_to_data, 'processed_plume_all.pt'))[:, self.step_index, ...]
+            p = torch.load(join(path_to_data, 'processed_pressure_all.pt'))[:, self.step_index, ...]
+            k = torch.load(join(path_to_data, 'processed_static_all.pt'))[:, None]
+            if self.dx is not None:
+                s = s[:, :, self.dx:-self.dx, self.dx:-self.dx, :]
+                p = p[:, :, self.dx:-self.dx, self.dx:-self.dx, :]
+            if self.split_index is not None:
+                s = s[self.split_index, ...]
+                p = p[self.split_index, ...]
+                k = k[self.split_index, ...]
+            plume.append(s)
+            press.append(p)
+            perm.append(k)
+
+        plume = torch.vstack(plume) 
+        press = torch.vstack(press)
+        perm  = torch.vstack(perm)
+        perm = torch.nn.functional.pad(perm, pad=(0,0,2,2,2,2), mode='constant', value=0)
+
+        return plume, press, perm
 
 
 class Trainer: # Base class for training and testing Simple-RUNET models
@@ -13,9 +62,12 @@ class Trainer: # Base class for training and testing Simple-RUNET models
             if device is None else device
         self.model = model.to(self.device)
         self.train_config = train_config
-
+        self.num_epochs = train_config.get('num_epochs', 200)
         self.verbose = train_config.get('verbose', 1)
-
+        self.learning_rate = train_config.get('learning_rate', 1e-4)
+        self.step_size = train_config.get('step_size', 100)
+        self.gamma = train_config.get('gamma', 0.95)
+        self.weight_decay = train_config.get('weight_decay', 0.0)
         self.gradient_clip = train_config.get('gradient_clip', False)
         self.gradient_clip_val = train_config.get('gradient_clip_val', None)
 
@@ -25,12 +77,8 @@ class Trainer: # Base class for training and testing Simple-RUNET models
         self.regularizer_weight = train_config.get('regularizer_weight', None)
 
         # Optimizer and LR scheduler
-        self._optimizer = torch.optim.Adam(self.model.parameters(),
-                                           lr=train_config.get('learning_rate'),
-                                           weight_decay=train_config.get('weight_decay'))
-        self._scheduler = StepLR(self._optimizer,
-                                 step_size=train_config['step_size'],
-                                 gamma=train_config['gamma'])
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
+        self.scheduler = StepLR(self.optimizer, step_size=self.step_size, gamma=self.gamma)
 
     def _extract_data_instance(self, data):
         _s, _p, _m = data
@@ -51,12 +99,12 @@ class Trainer: # Base class for training and testing Simple-RUNET models
         if save_epoch_ckpt:
             torch.save({
                 'model_state_dict': self.model.state_dict(),
-                'optimizer_state_dict': self._optimizer.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
             }, join(path_to_model, f'checkpoint{epoch}.pt'))
 
         torch.save({
             'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self._optimizer.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
         }, join(path_to_model, 'checkpoint.pt'))
         
         np.savez(join(path_to_model, 'loss_epoch.npz'),
@@ -75,23 +123,23 @@ class Trainer: # Base class for training and testing Simple-RUNET models
         batch_loss, pixel_loss, auxillary_loss = 0.0, 0.0, 0.0
 
         for i, data in enumerate(loop):
-            self._optimizer.zero_grad()
+            self.optimizer.zero_grad()
             out = self.forward(data)
             loss = out['loss']
             loss.backward()
 
-            if self.gradient_clip and self.gradient_clip_val is not None:
+            if self.gradient_clip and self.gradient_clip_val:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip_val)
 
-            self._optimizer.step()
-            self._scheduler.step()
+            self.optimizer.step()
+            self.scheduler.step()
 
             batch_loss += loss.item()
             pixel_loss += out['loss_pixel'].item()
             auxillary_loss += out['loss_auxillary'].item()
 
             if self.verbose == 1:
-                loop.set_description(f"Epoch [{epoch}/{self.train_config['num_epoch']}]")
+                loop.set_description(f"Epoch [{epoch+1}/{self.num_epochs}]")
                 loop.set_postfix(
                     loss=batch_loss / (i + 1),
                     pixel_loss=pixel_loss / (i + 1),
@@ -100,17 +148,24 @@ class Trainer: # Base class for training and testing Simple-RUNET models
 
         return batch_loss / (i + 1), pixel_loss / (i + 1), auxillary_loss / (i + 1)
 
-    def _validate(self, valid_loader):
+    def validate(self, valid_loader):
         self.model.eval()
         batch_vloss, pixel_vloss, auxillary_vloss = 0.0, 0.0, 0.0
+        loop = tqdm(valid_loader, desc="Validating") if self.verbose == 1 else valid_loader
 
-        for i, data in enumerate(valid_loader):
-
+        for i, data in enumerate(loop):
             with torch.no_grad():
                 out = self.forward(data)
                 batch_vloss += out['loss'].item()
                 pixel_vloss += out['loss_pixel'].item()
                 auxillary_vloss += out['loss_auxillary'].item()
+            
+            if self.verbose == 1:
+                loop.set_postfix(
+                    loss=batch_vloss / (i + 1),
+                    pixel_loss=pixel_vloss / (i + 1),
+                    aux_loss=auxillary_vloss / (i + 1)
+                )
 
         return batch_vloss / (i + 1), pixel_vloss / (i + 1), auxillary_vloss / (i + 1)
 
@@ -146,23 +201,23 @@ class Trainer: # Base class for training and testing Simple-RUNET models
 
         torch.autograd.set_detect_anomaly(True)
 
-        for epoch in range(self.train_config['num_epoch']):
-            self._optimizer.zero_grad()
+        for epoch in range(self.num_epochs):
+            self.optimizer.zero_grad()
             train_loss, pixel_loss, aux_loss = self._train_one_epoch(train_loader, epoch)
 
             train_loss_list.append(train_loss)
             train_pixel_loss.append(pixel_loss)
             train_aux_loss.append(aux_loss)
-            learning_rate_list.append(self._optimizer.param_groups[0]['lr'])
+            learning_rate_list.append(self.optimizer.param_groups[0]['lr'])
 
-            val_loss, val_pixel, val_aux = self._validate(valid_loader)
+            val_loss, val_pixel, val_aux = self.validate(valid_loader)
             valid_loss_list.append(val_loss)
             valid_pixel_loss.append(val_pixel)
             valid_aux_loss.append(val_aux)
 
             print(f"Epoch {epoch:03d}: Train - total {train_loss:.6f} | pixel {pixel_loss:.6f} | aux {aux_loss:.6f}")
             print(f"             Valid - total {val_loss:.6f} | pixel {val_pixel:.6f} | aux {val_aux:.6f}")
-            print(f"             LR: {self._scheduler.get_last_lr()}")
+            print(f"             LR: {self.scheduler.get_last_lr()}")
 
             self.save_checkpoint(
                 epoch=epoch,
