@@ -217,7 +217,7 @@ class Trainer: # Base class for training and testing Simple-RUNET models
         }
 
 
-class Trainer_RUNET(Trainer):
+class Trainer_RUNET(Trainer): # Trainer for RUNET models
     def __init__(self, model, train_config, wells=None, **kwargs):
         super().__init__(model, train_config, **kwargs)
         self.wells = wells or [(42, 42, 16), (42, 42, 17), (27, 27, 16), (27, 27, 17)]
@@ -256,91 +256,3 @@ class Trainer_RUNET(Trainer):
             'states': states.detach().cpu()
         }
 
-
-class Trainer_RUNET_with_Boundary_Loss(Trainer_RUNET):
-    def __init__(self, model, train_config, wells=None, **kwargs):
-        super().__init__(model, train_config, **kwargs)
-        self.regularizer_weight = train_config.get('regularizer_weight', 0.0)
-        self.wells = wells or [(42, 42, 16), (42, 42, 17), (27, 27, 16), (27, 27, 17)]
-
-    def _extract_data_instance(self, data):
-        _s, _p, _m, sd_map = data # (s, p, sd_map) ~ (B, T + 1, X, Y, Z), (m) ~ (B, 1, X, Y, Z)
-        _u = torch.zeros_like(_s[:, 1:]) # Placeholder for the control input (B, T, X, Y, Z)
-        for ix, iy, iz in self.wells:
-            _u[..., ix, iy, iz] = 1
-        contrl = _u[:, :, None].to(self.device) # Control input (B, T, 1, X, Y, Z)
-        states = torch.cat((_s[:, [0]], _p[:, [0]]), dim=1).to(self.device) # initial state
-        static = _m.to(self.device)
-        outputs = torch.cat((_s[:, 1:][:, :, None], _p[:, 1:][:, :, None]), dim=2).to(self.device)
-        sd_map = sd_map[:, 1:].to(self.device) 
-        return contrl, states, static, outputs, sd_map
-
-    def forward(self, data):
-        contrl, states, static, outputs, sd_map = self._extract_data_instance(data)
-
-        preds = self.model(contrl, states, static)
-
-        loss_pixel = self.loss_fn(preds, outputs)
-
-        loss_reg = self.regularizer_fn(preds, sd_map)
-
-        total_loss = loss_pixel + self.regularizer_weight * loss_reg
-        
-        return {
-            'loss': total_loss,
-            'loss_pixel': loss_pixel.detach(),
-            'loss_auxillary': loss_reg.detach(),
-            'preds': preds.detach().cpu(),
-            'outputs': outputs.detach().cpu(),
-            'static': static.detach().cpu(),
-            'states': states.detach().cpu(),
-            'sd_map': sd_map.detach().cpu()
-        }
-
-    def regularizer_fn(self, preds, sd_map):
-        """
-        Compute the boundary loss based on the map.
-        """
-        saturation = preds[:, :, 0]
-        # Compute the boundary loss
-        boundary_loss = torch.mean(saturation * sd_map)
-        return boundary_loss
-    
-    def test(self, test_loader):
-        self.model.eval()
-        preds, states, static, sd_map = [], [], [], []
-        batch_loss, pixel_loss, aux_loss = 0.0, 0.0, 0.0
-
-        loop = tqdm(test_loader) if self.verbose == 1 else test_loader
-
-        for i, data in enumerate(loop):
-
-            with torch.no_grad():
-                out = self.forward(data)
-
-            batch_loss += out['loss'].item()
-            pixel_loss += out['loss_pixel'].item()
-            aux_loss += out['loss_auxillary'].item()
-
-            preds.append(out['preds'])
-            states.append(out['outputs'])
-            static.append(out['static'])
-            sd_map.append(out['sd_map'])
-
-            if self.verbose == 1:
-                loop.set_description("Testing")
-                loop.set_postfix(
-                    loss=batch_loss / (i + 1),
-                    pixel_loss=pixel_loss / (i + 1),
-                    aux_loss=aux_loss / (i + 1)
-                )
-
-        return {
-            'preds': torch.vstack(preds),
-            'states': torch.vstack(states),
-            'static': torch.vstack(static),
-            'sd_map': torch.vstack(sd_map),
-            'test_loss': batch_loss / (i + 1),
-            'pixel_loss': pixel_loss / (i + 1),
-            'aux_loss': aux_loss / (i + 1)
-        }
