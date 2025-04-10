@@ -5,6 +5,7 @@ from torch.optim.lr_scheduler import StepLR
 from tqdm import tqdm
 from os.path import join
 from torch.utils.data import Dataset
+from collections import defaultdict
 
 
 class Dataset(Dataset):
@@ -55,11 +56,9 @@ class Dataset(Dataset):
         return plume, press, perm
 
 
-class Trainer: # Base class for training and testing Simple-RUNET models
+class GeneralTrainer:
     def __init__(self, model, train_config, pixel_loss=None, regularizer=None, device=None):
-        
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') \
-            if device is None else device
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') if device is None else device
         self.model = model.to(self.device)
         self.train_config = train_config
         self.num_epochs = train_config.get('num_epochs', 200)
@@ -80,22 +79,22 @@ class Trainer: # Base class for training and testing Simple-RUNET models
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
         self.scheduler = StepLR(self.optimizer, step_size=self.step_size, gamma=self.gamma)
 
-    def _extract_data_instance(self, data):
-        _s, _p, _m = data
-        states = torch.cat((_s[:, [0]], _p[:, [0]]), dim=1).to(self.device) # initial state
-        static = _m.to(self.device)
-        outputs = torch.cat((_s[:, 1:][:, :, None], _p[:, 1:][:, :, None]), dim=2).to(self.device)
-        return states, static, outputs
+    def forward(self, data):
+        """
+        Must be implemented by subclass. Should return:
+        {
+            'tensors': {...},    # any tensor-like outputs
+            'losses': {...}      # all loss terms, including 'loss', 'loss_pixel', etc.
+        }
+        """
+        raise NotImplementedError
 
-    def load_model(self, path_to_ckpt):
+    def load_checkpoint(self, path_to_ckpt):
         checkpoint = torch.load(join(path_to_ckpt, 'checkpoint.pt'), map_location=self.device)
         self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
-    def save_checkpoint(self, epoch, path_to_model, 
-                        train_loss_list, train_pixel_loss, train_aux_loss,
-                        valid_loss_list, valid_pixel_loss, valid_aux_loss,
-                        learning_rate_list, save_epoch_ckpt=True):
-        
+    def save_checkpoint(self, epoch, path_to_model, loss_tracker_dict, learning_rate_list, save_epoch_ckpt=True):
         if save_epoch_ckpt:
             torch.save({
                 'model_state_dict': self.model.state_dict(),
@@ -106,213 +105,188 @@ class Trainer: # Base class for training and testing Simple-RUNET models
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
         }, join(path_to_model, 'checkpoint.pt'))
-        
-        np.savez(join(path_to_model, 'loss_epoch.npz'),
-                 train_loss=np.array(train_loss_list),
-                 train_pixel=np.array(train_pixel_loss),
-                 train_aux=np.array(train_aux_loss),
-                 valid_loss=np.array(valid_loss_list),
-                 valid_pixel=np.array(valid_pixel_loss),
-                 valid_aux=np.array(valid_aux_loss),
-                 learning_rate=np.array(learning_rate_list))
 
-    def _train_one_epoch(self, train_loader, epoch):
-        self.model.train()
-        loop = tqdm(train_loader) if self.verbose == 1 else train_loader
+        # Save losses
+        loss_np_dict = {k: np.array(v) for k, v in loss_tracker_dict.items()}
+        loss_np_dict['learning_rate'] = np.array(learning_rate_list)
+        np.savez(join(path_to_model, 'loss_epoch.npz'), **loss_np_dict)
 
-        batch_loss, pixel_loss, auxillary_loss = 0.0, 0.0, 0.0
+    def _run_one_epoch(self, dataloader, epoch=None, train=True):
+        mode = 'train' if train else 'valid'
+        self.model.train() if train else self.model.eval()
+        loop = tqdm(dataloader, desc=f"{mode.capitalize()}ing") if self.verbose else dataloader
 
-        for i, data in enumerate(loop):
-            self.optimizer.zero_grad()
-            out = self.forward(data)
-            loss = out['loss']
-            loss.backward()
+        running_losses = defaultdict(float)
+        num_batches = 0
 
-            if self.gradient_clip and self.gradient_clip_val:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip_val)
+        for data in loop:
+            if train:
+                self.optimizer.zero_grad()
 
-            self.optimizer.step()
+            output = self.forward(data)
+            losses = output['losses']
+
+            loss = losses['loss']  # main loss
+            if train:
+                loss.backward()
+                if self.gradient_clip and self.gradient_clip_val:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip_val)
+                self.optimizer.step()
+
+            # Update statistics
+            for k, v in losses.items():
+                running_losses[k] += v.item()
+            num_batches += 1
+
+            if self.verbose:
+                loop.set_postfix({k: v / num_batches for k, v in running_losses.items()})
+
+        avg_losses = {k: v / num_batches for k, v in running_losses.items()}
+        return avg_losses
+
+    def train(self, train_loader, valid_loader, path_to_model, ckpt_epoch=5):
+        loss_tracker_dict = defaultdict(list)
+        learning_rate_list = []
+
+        for epoch in range(self.num_epochs):
+            train_losses = self._run_one_epoch(train_loader, epoch, train=True)
+            valid_losses = self._run_one_epoch(valid_loader, epoch, train=False)
+
+            for k, v in train_losses.items():
+                loss_tracker_dict[f'train_{k}'].append(v)
+            for k, v in valid_losses.items():
+                loss_tracker_dict[f'valid_{k}'].append(v)
+            learning_rate_list.append(self.optimizer.param_groups[0]['lr'])
+
+            if self.verbose:
+                train_loss_str = ' | '.join([f"{k}: {v:.4f}" for k, v in train_losses.items()])
+                valid_loss_str = ' | '.join([f"{k}: {v:.4f}" for k, v in valid_losses.items()])
+                print(f"Epoch {epoch+1:03d}: Train - {train_loss_str} | Valid - {valid_loss_str}")
+
             self.scheduler.step()
 
-            batch_loss += loss.item()
-            pixel_loss += out['loss_pixel'].item()
-            auxillary_loss += out['loss_auxillary'].item()
+            self.save_checkpoint(
+                epoch=epoch,
+                path_to_model=path_to_model,
+                loss_tracker_dict=loss_tracker_dict,
+                learning_rate_list=learning_rate_list,
+                save_epoch_ckpt=((epoch + 1) % ckpt_epoch == 0)
+            )
 
-            if self.verbose == 1:
-                loop.set_description(f"Epoch [{epoch+1}/{self.num_epochs}]")
-                loop.set_postfix(
-                    loss=batch_loss / (i + 1),
-                    pixel_loss=pixel_loss / (i + 1),
-                    aux_loss=auxillary_loss / (i + 1)
-                )
+        return loss_tracker_dict
 
-        return batch_loss / (i + 1), pixel_loss / (i + 1), auxillary_loss / (i + 1)
-
-    def validate(self, valid_loader):
+    def test(self, test_loader):
         self.model.eval()
-        batch_vloss, pixel_vloss, auxillary_vloss = 0.0, 0.0, 0.0
-        loop = tqdm(valid_loader, desc="Validating") if self.verbose == 1 else valid_loader
+        all_outputs = defaultdict(list)
+        running_losses = defaultdict(float)
+        num_batches = 0
 
-        for i, data in enumerate(loop):
+        loop = tqdm(test_loader, desc="Testing") if self.verbose else test_loader
+
+        for data in loop:
             with torch.no_grad():
-                out = self.forward(data)
-                batch_vloss += out['loss'].item()
-                pixel_vloss += out['loss_pixel'].item()
-                auxillary_vloss += out['loss_auxillary'].item()
-            
-            if self.verbose == 1:
-                loop.set_postfix(
-                    loss=batch_vloss / (i + 1),
-                    pixel_loss=pixel_vloss / (i + 1),
-                    aux_loss=auxillary_vloss / (i + 1)
-                )
+                output = self.forward(data)
 
-        return batch_vloss / (i + 1), pixel_vloss / (i + 1), auxillary_vloss / (i + 1)
+            for k, v in output['losses'].items():
+                running_losses[k] += v.item()
+            for k, v in output['tensors'].items():
+                all_outputs[k].append(v.cpu())
+
+            num_batches += 1
+            if self.verbose:
+                loop.set_postfix({k: f"{v / num_batches:.4f}" for k, v in running_losses.items()})
+
+        averaged_losses = {k: v / num_batches for k, v in running_losses.items()}
+        output_tensors = {k: torch.cat(v, dim=0) for k, v in all_outputs.items()}
+
+        return {
+            'losses': averaged_losses,
+            'tensors': output_tensors
+        }
+
+
+class Trainer(GeneralTrainer):
+    def __init__(self, model, train_config, pixel_loss=None, regularizer=None, device=None):
+        super().__init__(model, train_config, pixel_loss, regularizer, device)
+
+    def _extract_data_instance(self, data):
+        _s, _p, _m = data
+        states = torch.cat((_s[:, [0]], _p[:, [0]]), dim=1).to(self.device) # (B, 2, C, X, Y, Z)
+        static = _m.to(self.device)
+        outputs = torch.cat((_s[:, 1:][:, :, None], _p[:, 1:][:, :, None]), dim=2).to(self.device)
+        return states, static, outputs
 
     def forward(self, data):
-        
         states, static, outputs = self._extract_data_instance(data)
-
         preds = self.model(states, static)
 
         loss_pixel = self.loss_fn(preds, outputs)
-
         if self.regularizer is not None:
             loss_reg = self.regularizer_weight * self.regularizer(preds, outputs)
         else:
             loss_reg = torch.tensor(0.0, device=self.device)
 
         total_loss = loss_pixel + loss_reg
-        return {
-            'loss': total_loss,
-            'loss_pixel': loss_pixel.detach(),
-            'loss_auxillary': loss_reg.detach(),
-            'preds': preds.detach().cpu(),
-            'outputs': outputs.detach().cpu(),
-            'static': static.detach().cpu(),
-            'states': states.detach().cpu()
-        }
-
-    def train(self, train_loader, valid_loader, path_to_model, ckpt_epoch=5):
-        train_loss_list, valid_loss_list = [], []
-        train_pixel_loss, train_aux_loss = [], []
-        valid_pixel_loss, valid_aux_loss = [], []
-        learning_rate_list = []
-
-        torch.autograd.set_detect_anomaly(True)
-
-        for epoch in range(self.num_epochs):
-            self.optimizer.zero_grad()
-            train_loss, pixel_loss, aux_loss = self._train_one_epoch(train_loader, epoch)
-
-            train_loss_list.append(train_loss)
-            train_pixel_loss.append(pixel_loss)
-            train_aux_loss.append(aux_loss)
-            learning_rate_list.append(self.optimizer.param_groups[0]['lr'])
-
-            val_loss, val_pixel, val_aux = self.validate(valid_loader)
-            valid_loss_list.append(val_loss)
-            valid_pixel_loss.append(val_pixel)
-            valid_aux_loss.append(val_aux)
-
-            print(f"Epoch {epoch:03d}: Train - total {train_loss:.6f} | pixel {pixel_loss:.6f} | aux {aux_loss:.6f}")
-            print(f"             Valid - total {val_loss:.6f} | pixel {val_pixel:.6f} | aux {val_aux:.6f}")
-            print(f"             LR: {self.scheduler.get_last_lr()}")
-
-            self.save_checkpoint(
-                epoch=epoch,
-                path_to_model=path_to_model,
-                train_loss_list=train_loss_list,
-                train_pixel_loss=train_pixel_loss,
-                train_aux_loss=train_aux_loss,
-                valid_loss_list=valid_loss_list,
-                valid_pixel_loss=valid_pixel_loss,
-                valid_aux_loss=valid_aux_loss,
-                learning_rate_list=learning_rate_list,
-                save_epoch_ckpt=((epoch + 1) % ckpt_epoch == 0)
-            )
-
-        return train_loss_list, valid_loss_list
-
-    def test(self, test_loader):
-        self.model.eval()
-        preds, states, static = [], [], []
-        batch_loss, pixel_loss, aux_loss = 0.0, 0.0, 0.0
-
-        loop = tqdm(test_loader) if self.verbose == 1 else test_loader
-
-        for i, data in enumerate(loop):
-
-            with torch.no_grad():
-                out = self.forward(data)
-
-            batch_loss += out['loss'].item()
-            pixel_loss += out['loss_pixel'].item()
-            aux_loss += out['loss_auxillary'].item()
-
-            preds.append(out['preds'])
-            states.append(out['outputs'])
-            static.append(out['static'])
-
-            if self.verbose == 1:
-                loop.set_description("Testing")
-                loop.set_postfix(
-                    loss=batch_loss / (i + 1),
-                    pixel_loss=pixel_loss / (i + 1),
-                    aux_loss=aux_loss / (i + 1)
-                )
 
         return {
-            'preds': torch.vstack(preds),
-            'states': torch.vstack(states),
-            'static': torch.vstack(static),
-            'test_loss': batch_loss / (i + 1),
-            'pixel_loss': pixel_loss / (i + 1),
-            'aux_loss': aux_loss / (i + 1)
+            'tensors': {
+                'preds': preds,
+                'outputs': outputs,
+                'static': static,
+                'states': states,
+            },
+            'losses': {
+                'loss': total_loss,
+                'loss_pixel': loss_pixel.detach(),
+                'loss_auxillary': loss_reg.detach()
+            }
         }
 
 
-class Trainer_RUNET(Trainer): # Trainer for RUNET models
+class Trainer_RUNET(GeneralTrainer):  # Trainer for RUNET models
     def __init__(self, model, train_config, wells=None, **kwargs):
         super().__init__(model, train_config, **kwargs)
         self.wells = wells or [(42, 42, 16), (42, 42, 17), (27, 27, 16), (27, 27, 17)]
 
     def _extract_data_instance(self, data):
-        _s, _p, _m = data # (s, p) ~ (B, T + 1, X, Y, Z), (m) ~ (B, 1, X, Y, Z)
-        _u = torch.zeros_like(_s[:, 1:]) # Placeholder for the control input (B, T, X, Y, Z)
+        _s, _p, _m = data  # (s, p) ~ (B, T + 1, X, Y, Z), (m) ~ (B, 1, X, Y, Z)
+        _u = torch.zeros_like(_s[:, 1:])  # (B, T, X, Y, Z)
         for ix, iy, iz in self.wells:
             _u[..., ix, iy, iz] = 1
-        contrl = _u[:, :, None].to(self.device) # Control input (B, T, 1, X, Y, Z)
-        states = torch.cat((_s[:, [0]], _p[:, [0]]), dim=1).to(self.device) # initial state
-        static = _m.to(self.device)
-        outputs = torch.cat((_s[:, 1:][:, :, None], _p[:, 1:][:, :, None]), dim=2).to(self.device)
+        contrl = _u[:, :, None].to(self.device)  # (B, T, 1, X, Y, Z)
+        states = torch.cat((_s[:, [0]], _p[:, [0]]), dim=1).to(self.device)  # (B, 2, X, Y, Z)
+        static = _m.to(self.device)  # (B, 1, X, Y, Z)
+        outputs = torch.cat((_s[:, 1:][:, :, None], _p[:, 1:][:, :, None]), dim=2).to(self.device)  # (B, T, 2, X, Y, Z)
         return contrl, states, static, outputs
 
     def forward(self, data):
         contrl, states, static, outputs = self._extract_data_instance(data)
-
         preds = self.model(contrl, states, static)
 
         loss_pixel = self.loss_fn(preds, outputs)
-
         if self.regularizer is not None:
             loss_reg = self.regularizer(preds, outputs)
         else:
             loss_reg = torch.tensor(0.0, device=self.device)
 
         total_loss = loss_pixel + self.regularizer_weight * loss_reg
+
         return {
-            'loss': total_loss,
-            'loss_pixel': loss_pixel.detach(),
-            'loss_auxillary': loss_reg.detach(),
-            'preds': preds.detach().cpu(),
-            'outputs': outputs.detach().cpu(),
-            'static': static.detach().cpu(),
-            'states': states.detach().cpu()
+            'tensors': {
+                'preds': preds.detach().cpu(),
+                'outputs': outputs.detach().cpu(),
+                'static': static.detach().cpu(),
+                'states': states.detach().cpu()
+            },
+            'losses': {
+                'loss': total_loss,
+                'loss_pixel': loss_pixel.detach(),
+                'loss_auxillary': loss_reg.detach()
+            }
         }
 
 
-class Trainer_RUNET_2D(Trainer): # Trainer for 2D Dataset
+class Trainer_RUNET_2D(GeneralTrainer):  # Trainer for 2D Dataset
     def __init__(self, model, train_config, wells=None, **kwargs):
         super().__init__(model, train_config, **kwargs)
 
@@ -327,24 +301,63 @@ class Trainer_RUNET_2D(Trainer): # Trainer for 2D Dataset
 
     def forward(self, data):
         contrl, states, static, outputs = self._extract_data_instance(data)
-
         preds = self.model(contrl, states, static)
 
         loss_pixel = self.loss_fn(preds, outputs)
+        loss_reg = self.regularizer(preds, outputs) if self.regularizer else torch.tensor(0.0, device=self.device)
+        total_loss = loss_pixel + self.regularizer_weight * loss_reg
 
-        if self.regularizer is not None:
-            loss_reg = self.regularizer_weight * self.regularizer(preds, outputs)
-        else:
-            loss_reg = torch.tensor(0.0, device=self.device)
-
-        total_loss = loss_pixel + loss_reg
         return {
-            'loss': total_loss,
-            'loss_pixel': loss_pixel.detach(),
-            'loss_auxillary': loss_reg.detach(),
-            'preds': preds.detach().cpu(),
-            'outputs': outputs.detach().cpu(),
-            'static': static.detach().cpu(),
-            'states': states.detach().cpu()
+            'tensors': {
+                'preds': preds.detach().cpu(),
+                'outputs': outputs.detach().cpu(),
+                'states': states.detach().cpu(),
+                'static': static.detach().cpu()
+            },
+            'losses': {
+                'loss': total_loss,
+                'loss_pixel': loss_pixel.detach(),
+                'loss_auxillary': loss_reg.detach()
+            }
+        }
+
+
+class Trainer_LSDA(GeneralTrainer):
+    def _extract_data_instance(self, data):
+        inputs, outputs = data
+        contrl, _state, static = inputs
+        contrl = contrl.to(self.device)
+        static = static.to(self.device)
+        states = torch.cat((_state.unsqueeze(dim=1), outputs), dim=1)[:,:,-1:,...].to(self.device)
+        return contrl, states, static
+
+    def forward(self, data):
+        contrl, states, static = self._extract_data_instance(data)
+        m_recon, x_recon, x_pred = self.model(contrl, states, static)
+
+        m_recon_loss = self.loss_fn(m_recon, static)
+        x_recon_loss = self.loss_fn(x_recon, states)
+        x_pred_loss = self.loss_fn(x_pred, states[:,1:])
+        total = m_recon_loss + x_recon_loss + x_pred_loss
+
+        tensors = {
+                'x_pred': x_pred.detach().cpu(),
+                'x_recon': x_recon.detach().cpu(),
+                'm_recon': m_recon.detach().cpu(),
+                'static': static.detach().cpu(),
+                'states': states.detach().cpu(),
+                'contrl': contrl.detach().cpu(),
+            }
+        
+        losses = {
+            'loss': total,
+            'm_recon_loss': m_recon_loss.detach(),
+            'x_recon_loss': x_recon_loss.detach(),
+            'x_pred_loss': x_pred_loss.detach(),
+        }
+
+        return {
+            'tensors': tensors,
+            'losses': losses
         }
 
