@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import numpy as np
@@ -6,6 +7,8 @@ from tqdm import tqdm
 from os.path import join
 from torch.utils.data import Dataset
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from threading import Lock
 
 
 class DatasetCase1(Dataset):
@@ -55,6 +58,98 @@ class DatasetCase1(Dataset):
 
         return plume, press, perm
 
+
+class DatasetCase2(Dataset): # (512, 128, 1) - 2D reservoir
+    def __init__(self, sample_index, dir_to_database, timestep, pred_length=8):
+        self.sample_index = sample_index
+        self.dir_to_database = dir_to_database
+        self.timestep = timestep
+        self.pred_length = pred_length
+        self.total_step = len(timestep)
+
+        # create a dictionary of item keys
+        self.precomputed_keys = {}
+        self._precompute_keys()
+        self.nsample = len(self.precomputed_keys)
+
+        # Load data in parallel
+        self.M, self.S, self.P, self.C, self.indices = self.load_data_in_parallel()
+    
+    def __len__(self):
+        return self.nsample
+    
+    def _precompute_keys(self):
+        pred_length = self.pred_length
+        total_step = self.total_step
+        idx = 0
+        for sample_index, real_index in enumerate(self.sample_index):
+            for step_start in range(total_step - pred_length):
+                step_index = list(range(step_start, step_start + self.pred_length + 1)) # [initial step + prediction steps]
+                # Store the precomputed information in the dictionary
+                self.precomputed_keys[idx] = (sample_index, real_index, step_index)
+                idx += 1
+
+    def _load_data(self, idx):
+        perm  = np.load(os.path.join(self.dir_to_database, f'real{idx}_perm_real.npy'))
+        plume = np.load(os.path.join(self.dir_to_database, f'real{idx}_plume3d.npy'))[self.timestep]
+        press = np.load(os.path.join(self.dir_to_database, f'real{idx}_press3d.npy'))[self.timestep]
+        cntrl = np.load(os.path.join(self.dir_to_database, f'real{idx}_input_control.npy'))[:len(self.timestep[1:]),:]
+        return perm, plume, press, cntrl, idx
+
+    def load_data_in_parallel(self):
+        perm, plume, press, cntrl, indices = [], [], [], [], []
+        
+        lock = Lock()
+        with tqdm(total=len(self.sample_index)) as pbar:
+            def task_with_progress(index):
+                result = self._load_data(index)
+                with lock:
+                    pbar.update(1)
+                return result
+        
+            with ThreadPoolExecutor() as executor:
+                results = list(executor.map(task_with_progress, self.sample_index))
+                results = sorted(results, key=lambda x: x[4])
+        
+                for reali in results:
+                    _perm, _plume, _press, _cntrl, _index = reali
+                    perm.append(_perm)
+                    plume.append(_plume)
+                    press.append(_press)
+                    cntrl.append(_cntrl)
+                    indices.append(_index)
+                
+        # Convert to tensors and preprocess
+        perm  = np.array(perm).transpose((0, 1, 4, 2, 3))[:,:,:,4:-4,:]
+        nlogk = (np.log10(perm) - np.log10(1.0)) / np.log10(2000)
+        plume = np.array(plume)[:,:,:,4:-4,:]    
+        press = (np.array(press)[:,:,:,4:-4,:] - 9810) / (33110 - 9810)
+        cntrl = np.array(cntrl)
+        indices = np.array(indices)
+        
+        data = (torch.tensor(nlogk, dtype=torch.float32), # m
+                torch.tensor(plume, dtype=torch.float32), # s
+                torch.tensor(press, dtype=torch.float32), # p
+                torch.tensor(cntrl, dtype=torch.float32), # c
+                indices
+               )
+        return data
+    
+    def __getitem__(self, idx):
+        sample_index, real_index, step_index = self.precomputed_keys[idx]
+                
+        s0 = self.S[sample_index, step_index[0:1]]
+        p0 = self.P[sample_index, step_index[0:1]]
+        st = self.S[sample_index, step_index[1:]].unsqueeze(dim=1)
+        pt = self.P[sample_index, step_index[1:]].unsqueeze(dim=1)
+
+        static = self.M[sample_index]
+        states = torch.cat((p0, s0), dim=0)
+        contrl = torch.zeros(st.size(), dtype=torch.float32)
+        contrl[:, :, 100, 255, 0] = 1
+        output = torch.cat((pt, st), dim=1)
+        return (contrl, states, static), output
+    
 
 class GeneralTrainer:
     def __init__(self, model, train_config, pixel_loss=None, regularizer=None, device=None):
@@ -243,7 +338,7 @@ class Trainer(GeneralTrainer):
         }
 
 
-class Trainer_RUNET(GeneralTrainer):  # Trainer for RUNET models
+class TrainerCase1(GeneralTrainer):  # Trainer for Case 1 - 3D Dataset
     def __init__(self, model, train_config, wells=None, **kwargs):
         super().__init__(model, train_config, **kwargs)
         self.wells = wells or [(42, 42, 16), (42, 42, 17), (27, 27, 16), (27, 27, 17)]
@@ -264,19 +359,15 @@ class Trainer_RUNET(GeneralTrainer):  # Trainer for RUNET models
         preds = self.model(contrl, states, static)
 
         loss_pixel = self.loss_fn(preds, outputs)
-        if self.regularizer is not None:
-            loss_reg = self.regularizer(preds, outputs)
-        else:
-            loss_reg = torch.tensor(0.0, device=self.device)
-
+        loss_reg = self.regularizer(preds, outputs) if self.regularizer else torch.tensor(0.0, device=self.device)
         total_loss = loss_pixel + self.regularizer_weight * loss_reg
 
         return {
             'tensors': {
                 'preds': preds.detach().cpu(),
                 'outputs': outputs.detach().cpu(),
-                'static': static.detach().cpu(),
-                'states': states.detach().cpu()
+                'states': states.detach().cpu(),
+                'static': static.detach().cpu()
             },
             'losses': {
                 'loss': total_loss,
@@ -286,7 +377,7 @@ class Trainer_RUNET(GeneralTrainer):  # Trainer for RUNET models
         }
 
 
-class Trainer_RUNET_2D(GeneralTrainer):  # Trainer for 2D Dataset
+class TrainerCase2(GeneralTrainer):  # Trainer for Case 2 - 2D Dataset
     def __init__(self, model, train_config, wells=None, **kwargs):
         super().__init__(model, train_config, **kwargs)
 
