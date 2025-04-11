@@ -1,0 +1,31 @@
+train_config:
+  learning_rate: 0.001
+  num_epochs: 200
+  weight_decay: 0.0
+  batch_size: 2
+  verbose: 1
+  gradient_clip: false
+  gradient_clip_val: null  # Use null to indicate None
+  step_size: 250
+  gamma: 0.975
+
+model_config:
+  filters: 16
+  units: [1, 1, 2] # nstatic, ncontrols, noutputs
+  norm_type: group
+  num_groups: 4
+  strides: [2, 2]
+  with_control: false
+
+dataset_config:
+  num_years: 6
+  interval: 4
+  trainingset_folders:
+    - twowell_tworange_g20_z2
+    - twowell_tworange_g60_z2
+    - twowell_tworange_g100_z2
+    - twowell_tworange_g20_z5
+    - twowell_tworange_g60_z5
+    - twowell_tworange_g100_z5
+  validateset_folders:
+    - twowell_tworange_g20_z5

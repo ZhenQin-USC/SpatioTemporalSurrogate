@@ -1,0 +1,25 @@
+train_config:
+  learning_rate: 0.0005 # 1e-4
+  num_epochs: 100
+  weight_decay: 0.0
+  batch_size: 4
+  verbose: 1
+  gradient_clip: true
+  gradient_clip_val: 40
+  step_size: 1000
+  gamma: 0.9
+
+model_config:
+  filters: 16
+  units: [1, 1, 2] # nstatic, ncontrols, noutputs (states)
+  kernel_size: [5, 5, 1]
+  padding: [2, 2, 0]
+  with_control: True
+  with_states: True
+  norm_type: 'group'
+  num_groups: 4
+  strides: [[2, 2, 1], [2, 2, 1]]
+
+dataset_config:
+  pred_length: 8
+  year: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
