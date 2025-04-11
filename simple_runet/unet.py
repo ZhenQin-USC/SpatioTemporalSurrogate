@@ -429,7 +429,7 @@ class RUNetSequential(nn.Module):
         return preds
 
 
-class RUNet(RUNetSequential):
+class RUNetParallel(RUNetSequential):
     """
     A parallel variant of RUNet where control encoder and decoder operate independently,
     useful when control signal needs to be disentangled or multi-streamed.

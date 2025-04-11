@@ -131,7 +131,9 @@ class GeneralTrainer:
                 loss.backward()
                 if self.gradient_clip and self.gradient_clip_val:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip_val)
+                
                 self.optimizer.step()
+                self.scheduler.step()
 
             # Update statistics
             for k, v in losses.items():
@@ -162,8 +164,6 @@ class GeneralTrainer:
                 train_loss_str = ' | '.join([f"{k}: {v:.4f}" for k, v in train_losses.items()])
                 valid_loss_str = ' | '.join([f"{k}: {v:.4f}" for k, v in valid_losses.items()])
                 print(f"Epoch {epoch+1:03d}: Train - {train_loss_str} | Valid - {valid_loss_str}")
-
-            self.scheduler.step()
 
             self.save_checkpoint(
                 epoch=epoch,

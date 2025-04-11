@@ -188,7 +188,7 @@ class SpatialGradientLoss3D(nn.Module):
         self.loss_type = loss_type.lower()
 
         # set default reduction dims
-        self.reduce_dims = reduce_dims if reduce_dims is not None else (2, 3, 4, 5)
+        self.reduce_dims = reduce_dims if reduce_dims is not None else (1, 2, 3, 4)
 
         assert self.loss_type in ['l1', 'mse', 'rel_l1', 'rel_mse']
         assert self.filter_type in ['sobel', 'scharr', 'central', 'laplacian']
@@ -206,8 +206,9 @@ class SpatialGradientLoss3D(nn.Module):
         kernels = self.kernels.to(pred.device, pred.dtype)  # (N,1,3,3,3)
 
         # Flatten (B, C) → (B*C, 1, D, H, W)
-        pred_ = pred.flatten(0, 1)
-        target_ = target.flatten(0, 1)
+        pred_ = pred.flatten(0, 1).contiguous().unsqueeze(dim=1)
+        target_ = target.flatten(0, 1).contiguous().unsqueeze(dim=1)
+        # print("After flatten: ", pred_.shape, target_.shape)
 
         # Apply gradient filters
         grad_pred = F.conv3d(pred_, kernels, padding=1)    # (B*C, N, D, H, W)
@@ -255,7 +256,7 @@ class BaseMultiFieldLoss3D(nn.Module):
             return x.view(B, T * F, X, Y, Z)
 
     def forward(self, preds: torch.Tensor, trues: torch.Tensor):
-        p_preds, s_preds = torch.chunk(preds, 2, dim=2)
+        p_preds, s_preds = torch.chunk(preds, 2, dim=2) # 
         p_trues, s_trues = torch.chunk(trues, 2, dim=2)
 
         losses = []
