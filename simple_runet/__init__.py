@@ -14,6 +14,7 @@ from .losses import MultiFieldSSIMLoss, MultiFieldGradientLoss, MultiFieldPercep
 
 from .trainer import (
     DatasetCase1,
+    DatasetCase2,
     Trainer,
     TrainerCase1,
     TrainerCase2,
