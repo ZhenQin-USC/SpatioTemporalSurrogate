@@ -8,7 +8,7 @@ from torch.utils.data import Dataset
 from collections import defaultdict
 
 
-class Dataset(Dataset):
+class DatasetCase1(Dataset):
     def __init__(self, folders, root_to_data, num_years=5, interval=1, total_step=61, dx=2, split_index=None):
         self.folders = folders
         self.dx = dx
