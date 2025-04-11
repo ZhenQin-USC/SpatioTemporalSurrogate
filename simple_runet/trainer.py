@@ -2,11 +2,14 @@ import os
 import torch
 import torch.nn as nn
 import numpy as np
-from torch.optim.lr_scheduler import StepLR
-from tqdm import tqdm
+
 from os.path import join
-from torch.utils.data import Dataset
+from tqdm import tqdm
 from collections import defaultdict
+
+from torch.optim.lr_scheduler import StepLR
+from torch.utils.data import Dataset
+
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from threading import Lock
 
