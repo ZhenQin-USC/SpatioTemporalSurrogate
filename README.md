@@ -26,6 +26,13 @@ simple_runet/
 ```
 
 ---
+## How to run:
+
+Run Case1-Train.ipynb for a simple 3D toy example.
+
+(To Do ...) Run Case2-Train.ipynb for a simple 2D toy example.
+
+---
 
 ## Key packages:
 
