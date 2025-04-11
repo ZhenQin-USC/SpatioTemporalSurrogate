@@ -12,7 +12,7 @@ A surrogate modeling framework for learning spatiotemporal physical fields, powe
 ---
 
 ## Project Structure:
-"""
+```
 simple_runet/ 
 ├── __init__.py
 ├── losses.py   # MultiFieldLoss family 
@@ -25,7 +25,7 @@ simple_runet/
 ├── get_kernels_3d.py 
 ├── requirements.txt 
 └── README.md
-"""
+```
 
 ---
 
