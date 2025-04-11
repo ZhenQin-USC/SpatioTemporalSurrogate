@@ -1,8 +1,10 @@
 import torch
 import torch.nn as nn
 import kornia 
+import torch.nn.functional as F
 from typing import (Union, Optional, Dict, List, Tuple)
 from .lpips import LPIPS
+from get_kernels_3d import get_kernels_3d
 
 
 class RelativeError(object):
@@ -272,3 +274,65 @@ class PerceptualLoss3D(nn.Module):
         s_ploss = self._perceptual_loss(s_trues_reshaped[indices], s_preds_reshaped[indices])
         
         return p_ploss, s_ploss
+
+
+class SpatialGradientLoss3D(nn.Module):
+    def __init__(self, filter_type='sobel', loss_type='l1', reduce_dims=None):
+        """
+        Spatial gradient-based loss for 3D data.
+
+        Args:
+            filter_type: one of ['sobel', 'scharr', 'central', 'laplacian']
+            loss_type: one of ['l1', 'mse', 'rel_l1', 'rel_mse']
+            reduce_dims: tuple of dims to reduce (only used for relative losses)
+                         default: (2, 3, 4, 5) → reduce over (N, D, H, W)
+        """
+        super().__init__()
+        self.filter_type = filter_type.lower()
+        self.loss_type = loss_type.lower()
+
+        # set default reduction dims
+        self.reduce_dims = reduce_dims if reduce_dims is not None else (2, 3, 4, 5)
+
+        assert self.loss_type in ['l1', 'mse', 'rel_l1', 'rel_mse']
+        assert self.filter_type in ['sobel', 'scharr', 'central', 'laplacian']
+
+
+        self.kernels = get_kernels_3d(self.filter_type)  # shape (N, 1, 3, 3, 3)
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor):
+        """
+        pred, target: shape (B, C, D, H, W)
+        Applies same spatial filters to each channel independently.
+        """
+        assert pred.shape == target.shape, "Shape mismatch"
+        B, C, D, H, W = pred.shape
+        N = self.kernels.shape[0]  # number of directional filters
+        kernels = self.kernels.to(pred.device, pred.dtype)  # (N,1,3,3,3)
+
+        # Flatten (B, C) → (B*C, 1, D, H, W)
+        pred_ = pred.flatten(0, 1)
+        target_ = target.flatten(0, 1)
+
+        # Apply gradient filters
+        grad_pred = F.conv3d(pred_, kernels, padding=1)    # (B*C, N, D, H, W)
+        grad_target = F.conv3d(target_, kernels, padding=1)
+
+        # Compute loss
+        if self.loss_type == 'l1':
+            return F.l1_loss(grad_pred, grad_target)
+
+        elif self.loss_type == 'mse':
+            return F.mse_loss(grad_pred, grad_target)
+
+        elif self.loss_type == 'rel_l1':
+            num = torch.abs(grad_pred - grad_target).mean(dim=self.reduce_dims)      # (B, C)
+            den = torch.abs(grad_target).mean(dim=self.reduce_dims) + 1e-8
+            rel = num / den
+            return rel.mean()
+
+        elif self.loss_type == 'rel_mse':
+            num = ((grad_pred - grad_target) ** 2).mean(dim=self.reduce_dims)  # (B, C)
+            den = (grad_target ** 2).mean(dim=self.reduce_dims) + 1e-8
+            rel = num / den
+            return rel.mean()
