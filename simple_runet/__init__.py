@@ -12,9 +12,12 @@ from .unet import SimpleRUNet
 from .unet import RUNetParallel as RUNet
 from .losses import MultiFieldSSIMLoss, MultiFieldGradientLoss, MultiFieldPerceptualLoss
 
-from .trainer import (
+from .dataset import (
     DatasetCase1,
     DatasetCase2,
+)
+
+from .trainer import (
     Trainer,
     TrainerCase1,
     TrainerCase2,
