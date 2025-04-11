@@ -3,8 +3,10 @@ import torch.nn as nn
 import kornia 
 import torch.nn.functional as F
 from typing import (Union, Optional, Dict, List, Tuple)
+
+from .get_kernels_3d import get_kernels_3d
 from .lpips import LPIPS
-from get_kernels_3d import get_kernels_3d
+from .registry import register_multifield_loss
 
 
 class RelativeError(object):
@@ -169,113 +171,6 @@ class PerceptualLoss(nn.Module):
         return torch.mean(loss)
 
 
-class SSIMLoss(nn.Module):
-
-    def __init__(self, window_size, max_val=1.0, eps=1e-12, reduction='mean', padding='same', mode='both'):
-        """
-        Parameters:
-        - window_size: Size of the 3D SSIM window
-        - max_val: Normalization value of data
-        - reduction: 'mean', 'sum', or 'none'
-        - mode: 'both', 'pressure', or 'saturation'
-        """
-        super().__init__()
-        self.window_size = window_size
-        self.max_val = max_val
-        self.eps = eps
-        self.reduction = reduction
-        self.padding = padding
-        assert mode in ['both', 'pressure', 'saturation'], "mode must be 'both', 'pressure', or 'saturation'"
-        self.mode = mode
-
-    def __call__(self, preds, trues):
-        """
-        Computes the SSIM loss between predictions and targets.
-
-        Parameters:
-        - preds: Predicted outputs. (B, T, 2*F, X, Y, Z) = [p_trues || s_trues]
-        - trues: Ground truth outputs. (B, T, 2*F, X, Y, Z) = [p_preds || s_preds]
-
-        Returns:
-        - SSIM loss value.
-        """
-        B, T, X, Y, Z = trues.size(0), trues.size(1), trues.size(3), trues.size(4), trues.size(5)
-
-        # Chunk into [primary || secondary]
-        p_trues, s_trues = torch.chunk(trues, chunks=2, dim=2)  # (B, T, F, X, Y, Z)
-        p_preds, s_preds = torch.chunk(preds, chunks=2, dim=2)  # (B, T, F, X, Y, Z)
-
-        F = p_trues.size(2)  # Number of frames
-
-        # Merge T and F into channel dimension
-        p_trues = p_trues.view(B, T * F, X, Y, Z)
-        s_trues = s_trues.view(B, T * F, X, Y, Z)
-        p_preds = p_preds.view(B, T * F, X, Y, Z)
-        s_preds = s_preds.view(B, T * F, X, Y, Z)
-
-        # Selectively compute SSIM
-        losses = []
-        if self.mode in ['both', 'pressure']:
-            p_ssim = kornia.losses.ssim3d_loss(
-                p_preds, p_trues,
-                window_size=self.window_size,
-                max_val=self.max_val,
-                reduction=self.reduction
-            )
-            losses.append(p_ssim)
-
-        if self.mode in ['both', 'saturation']:
-            s_ssim = kornia.losses.ssim3d_loss(
-                s_preds, s_trues,
-                window_size=self.window_size,
-                max_val=self.max_val,
-                reduction=self.reduction
-            )
-            losses.append(s_ssim)
-
-        return sum(losses) / len(losses)
-
-
-class PerceptualLoss3D(nn.Module):
-    """
-    Wrapper for perceptual loss that allows for the use of different perceptual loss functions.
-    """
-    def __init__(self, device, num_img_for_perceptual: int = 16):
-        super().__init__()
-        self._perceptual_loss = PerceptualLoss(spatial_dims=2, network_type="vgg").to(device)
-        self.num_img_for_perceptual = num_img_for_perceptual
-
-    def __call__(self, preds, trues):
-        """
-        Computes the perceptual loss between predictions and targets.
-
-        Parameters:
-        - preds: Predicted outputs. (B, T, 2*F, X, Y, Z) = [p_trues || s_trues]
-        - trues: Ground truth outputs. (B, T, 2*F, X, Y, Z) = [p_preds || s_preds]
-
-        Returns:
-        - Perceptual loss value.
-        """
-        B, T, X, Y, Z = trues.size(0), trues.size(1), trues.size(3), trues.size(4), trues.size(5)
-
-        p_trues, s_trues = torch.chunk(trues, chunks=2, dim=2)  # (B, T, F, X, Y, Z)
-        p_preds, s_preds = torch.chunk(preds, chunks=2, dim=2)  # (B, T, F, X, Y, Z)
-        
-        p_trues_reshaped = p_trues.permute(0, -1, 1, 2, 3, 4).contiguous().view(-1, 1, X, Y) # (B*Z*T*F, X, Y)
-        p_preds_reshaped = p_preds.permute(0, -1, 1, 2, 3, 4).contiguous().view(-1, 1, X, Y)
-        s_trues_reshaped = s_trues.permute(0, -1, 1, 2, 3, 4).contiguous().view(-1, 1, X, Y)
-        s_preds_reshaped = s_preds.permute(0, -1, 1, 2, 3, 4).contiguous().view(-1, 1, X, Y)
-
-        total_images = p_trues_reshaped.size(0)
-        indices = torch.randperm(total_images)[:self.num_img_for_perceptual]
-
-        p_ploss = self._perceptual_loss(p_trues_reshaped[indices], p_preds_reshaped[indices])
-
-        s_ploss = self._perceptual_loss(s_trues_reshaped[indices], s_preds_reshaped[indices])
-        
-        return p_ploss, s_ploss
-
-
 class SpatialGradientLoss3D(nn.Module):
     def __init__(self, filter_type='sobel', loss_type='l1', reduce_dims=None):
         """
@@ -286,6 +181,7 @@ class SpatialGradientLoss3D(nn.Module):
             loss_type: one of ['l1', 'mse', 'rel_l1', 'rel_mse']
             reduce_dims: tuple of dims to reduce (only used for relative losses)
                          default: (2, 3, 4, 5) → reduce over (N, D, H, W)
+        Return: loss as a scalar
         """
         super().__init__()
         self.filter_type = filter_type.lower()
@@ -296,7 +192,6 @@ class SpatialGradientLoss3D(nn.Module):
 
         assert self.loss_type in ['l1', 'mse', 'rel_l1', 'rel_mse']
         assert self.filter_type in ['sobel', 'scharr', 'central', 'laplacian']
-
 
         self.kernels = get_kernels_3d(self.filter_type)  # shape (N, 1, 3, 3, 3)
 
@@ -336,3 +231,71 @@ class SpatialGradientLoss3D(nn.Module):
             den = (grad_target ** 2).mean(dim=self.reduce_dims) + 1e-8
             rel = num / den
             return rel.mean()
+
+
+class BaseMultiFieldLoss3D(nn.Module):
+    def __init__(self, mode='both', pseudo_3d=False):
+        """
+        Base class for multi-field loss on 3D data.
+
+        Args:
+            mode: 'both', 'pressure', or 'saturation'
+            pseudo_3d: if True, flatten Z into batch and apply 2D loss
+        """
+        super().__init__()
+        assert mode in ['both', 'pressure', 'saturation']
+        self.mode = mode
+        self.pseudo_3d = pseudo_3d
+
+    def reshape(self, x):
+        B, T, F, X, Y, Z = x.shape
+        if self.pseudo_3d:
+            return x.permute(0, -1, 1, 2, 3, 4).contiguous().view(-1, 1, X, Y)
+        else:
+            return x.view(B, T * F, X, Y, Z)
+
+    def forward(self, preds: torch.Tensor, trues: torch.Tensor):
+        p_preds, s_preds = torch.chunk(preds, 2, dim=2)
+        p_trues, s_trues = torch.chunk(trues, 2, dim=2)
+
+        losses = []
+        if self.mode in ['both', 'pressure']:
+            losses.append(self.loss_fn(self.reshape(p_preds), self.reshape(p_trues)))
+        if self.mode in ['both', 'saturation']:
+            losses.append(self.loss_fn(self.reshape(s_preds), self.reshape(s_trues)))
+
+        return sum(losses) / len(losses)
+
+    def loss_fn(self, x, y):
+        raise NotImplementedError("Subclasses must implement this method.")
+        
+
+@register_multifield_loss("ssim")
+class MultiFieldSSIMLoss(BaseMultiFieldLoss3D):
+    def __init__(self, window_size=7, max_val=1.0, reduction='mean', **kwargs):
+        super().__init__(**kwargs)
+        self.loss_fn = lambda x, y: kornia.losses.ssim3d_loss(
+            x, y, window_size=window_size, max_val=max_val, reduction=reduction
+        )
+
+
+@register_multifield_loss("gradient")
+class MultiFieldGradientLoss(BaseMultiFieldLoss3D):
+    def __init__(self, filter_type='sobel', loss_type='l1', reduce_dims=None, **kwargs):
+        super().__init__(**kwargs)
+        grad_loss = SpatialGradientLoss3D(filter_type, loss_type, reduce_dims)
+        self.loss_fn = lambda x, y: grad_loss(x, y)
+
+
+@register_multifield_loss("perceptual")
+class MultiFieldPerceptualLoss(BaseMultiFieldLoss3D):
+    def __init__(self, device, num_img=16, **kwargs):
+        kwargs['pseudo_3d'] = True
+        super().__init__(**kwargs)
+        self.perceptual = PerceptualLoss(spatial_dims=2, network_type="vgg").to(device)
+        self.num_img = num_img
+
+    def loss_fn(self, x, y):
+        idx = torch.randperm(x.size(0))[:self.num_img]
+        return self.perceptual(x[idx], y[idx])
+
