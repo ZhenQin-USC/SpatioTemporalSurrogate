@@ -3,11 +3,9 @@
 A surrogate modeling framework for learning spatiotemporal physical fields, powered by deep neural networks (e.g., Recurrent U-Net), and designed for CO₂ plume prediction.
 
 ## Features
-- ✅ Supports 3D structured inputs: `(B, T, C, X, Y, Z)`
+- ✅ Supports 4D structured inputs using hierarchical deep learning model: `(B, T, C, X, Y, Z)`
 - ✅ Modular training framework (Trainer class)
-- ✅ Multi-field loss support (SSIM, Gradient, Perceptual)
-- ✅ Easily configurable via Python
-- ✅ Compatible with PyTorch and MONAI
+- ✅ Loss support (SSIM, Gradient, Perceptual)
 
 ---
 
