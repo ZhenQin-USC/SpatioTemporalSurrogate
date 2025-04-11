@@ -344,7 +344,7 @@ class SimpleRUNet(nn.Module):
         return preds
 
 
-class RUNet(nn.Module):
+class RUNetSequential(nn.Module):
     def __init__(self, 
                  filters: int, 
                  units: List[int] = [10, 2, 2], 
@@ -429,7 +429,7 @@ class RUNet(nn.Module):
         return preds
 
 
-class RUNetParallel(RUNet):
+class RUNet(RUNetSequential):
     """
     A parallel variant of RUNet where control encoder and decoder operate independently,
     useful when control signal needs to be disentangled or multi-streamed.
