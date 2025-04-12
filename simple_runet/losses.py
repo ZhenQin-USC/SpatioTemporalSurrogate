@@ -84,7 +84,6 @@ class RSELoss(object):
 
 
 class PerceptualLoss(nn.Module):
-
     def __init__(
         self,
         spatial_dims: int,
@@ -113,13 +112,13 @@ class PerceptualLoss(nn.Module):
         self.is_fake_3d = is_fake_3d
         self.fake_3d_ratio = fake_3d_ratio
 
-    def _calculate_axis_loss(self, input: torch.Tensor, target: torch.Tensor, spatial_axis: int) -> torch.Tensor:
+    def _calculate_axis_loss(self, pred: torch.Tensor, target: torch.Tensor, spatial_axis: int) -> torch.Tensor:
         """
         Calculate perceptual loss in one of the axis used in the 2.5D approach. After the slices of one spatial axis
         is transformed into different instances in the batch, we compute the loss using the 2D approach.
 
         Args:
-            input: input 5D tensor. BNHWD
+            pred: pred 5D tensor. BNHWD
             target: target 5D tensor. BNHWD
             spatial_axis: spatial axis to obtain the 2D slices.
         """
@@ -137,7 +136,7 @@ class PerceptualLoss(nn.Module):
         preserved_axes.remove(spatial_axis)
 
         channel_axis = 1
-        input_slices = batchify_axis(x=input, fake_3d_perm=(spatial_axis, channel_axis) + tuple(preserved_axes))
+        input_slices = batchify_axis(x=pred, fake_3d_perm=(spatial_axis, channel_axis) + tuple(preserved_axes))
         indices = torch.randperm(input_slices.shape[0])[: int(input_slices.shape[0] * self.fake_3d_ratio)].to(
             input_slices.device
         )
@@ -149,26 +148,79 @@ class PerceptualLoss(nn.Module):
 
         return axis_loss
 
-    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            input: the shape should be BNHW[D].
+            pred: the shape should be BNHW[D].
             target: the shape should be BNHW[D].
         """
-        if target.shape != input.shape:
-            raise ValueError(f"ground truth has differing shape ({target.shape}) from input ({input.shape})")
+        if target.shape != pred.shape:
+            raise ValueError(f"ground truth has differing shape ({target.shape}) from pred ({pred.shape})")
 
         if self.spatial_dims == 3 and self.is_fake_3d:
             # Compute 2.5D approach
-            loss_sagittal = self._calculate_axis_loss(input, target, spatial_axis=2)
-            loss_coronal = self._calculate_axis_loss(input, target, spatial_axis=3)
-            loss_axial = self._calculate_axis_loss(input, target, spatial_axis=4)
+            loss_sagittal = self._calculate_axis_loss(pred, target, spatial_axis=2)
+            loss_coronal = self._calculate_axis_loss(pred, target, spatial_axis=3)
+            loss_axial = self._calculate_axis_loss(pred, target, spatial_axis=4)
             loss = loss_sagittal + loss_axial + loss_coronal
         else:
             # 2D and real 3D cases
-            loss = self.perceptual_function(input, target)
+            loss = self.perceptual_function(pred, target)
 
         return torch.mean(loss)
+
+
+class PixelWiseLoss3D(nn.Module):
+    def __init__(self, loss_type='l1', p=2.0, reduce_dims=None):
+        """
+        Pixel-wise loss for 3D data.
+
+        Args:
+            loss_type: one of ['l1', 'mse', 'rel_l1', 'rel_mse', 'lp', 'rel_lp']
+            p: float, p-norm (only used for 'lp' and 'rel_lp')
+            reduce_dims: dims to reduce over (default (1,2,3,4) = C,D,H,W)
+        """
+        super().__init__()
+        self.loss_type = loss_type.lower()
+        self.p = p
+        self.reduce_dims = reduce_dims if reduce_dims is not None else (1, 2, 3, 4)
+
+        assert self.loss_type in ['l1', 'mse', 'rel_l1', 'rel_mse', 'lp', 'rel_lp']
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        pred, target: (B, C, D, H, W)
+        Returns scalar loss
+        """
+        assert pred.shape == target.shape, "Shape mismatch"
+
+        if self.loss_type == 'l1':
+            return F.l1_loss(pred, target)
+
+        elif self.loss_type == 'mse':
+            return F.mse_loss(pred, target)
+
+        elif self.loss_type == 'lp':
+            diff = torch.abs(pred - target) ** self.p
+            return diff.mean()
+
+        elif self.loss_type == 'rel_l1':
+            num = torch.abs(pred - target).mean(dim=self.reduce_dims)
+            den = torch.abs(target).mean(dim=self.reduce_dims) + 1e-8
+            rel = num / den
+            return rel if rel.ndim == 0 else rel.mean()
+
+        elif self.loss_type == 'rel_mse':
+            num = ((pred - target) ** 2).mean(dim=self.reduce_dims)
+            den = (target ** 2).mean(dim=self.reduce_dims) + 1e-8
+            rel = num / den
+            return rel if rel.ndim == 0 else rel.mean()
+
+        elif self.loss_type == 'rel_lp':
+            num = (torch.abs(pred - target) ** self.p).mean(dim=self.reduce_dims)
+            den = (torch.abs(target) ** self.p).mean(dim=self.reduce_dims) + 1e-8
+            rel = num / den
+            return rel if rel.ndim == 0 else rel.mean()
 
 
 class SpatialGradientLoss3D(nn.Module):
@@ -195,7 +247,7 @@ class SpatialGradientLoss3D(nn.Module):
 
         self.kernels = get_kernels_3d(self.filter_type)  # shape (N, 1, 3, 3, 3)
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor):
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
         pred, target: shape (B, C, D, H, W)
         Applies same spatial filters to each channel independently.
@@ -271,13 +323,11 @@ class BaseMultiFieldLoss3D(nn.Module):
         raise NotImplementedError("Subclasses must implement this method.")
         
 
-@register_multifield_loss("ssim")
-class MultiFieldSSIMLoss(BaseMultiFieldLoss3D):
-    def __init__(self, window_size=7, max_val=1.0, reduction='mean', **kwargs):
+@register_multifield_loss("pixel")
+class MultiFieldPixelWiseLoss(BaseMultiFieldLoss3D):
+    def __init__(self, loss_type='l1', p=2.0, reduce_dims=None, **kwargs):
         super().__init__(**kwargs)
-        self.loss_fn = lambda x, y: kornia.losses.ssim3d_loss(
-            x, y, window_size=window_size, max_val=max_val, reduction=reduction
-        )
+        self.loss_fn = PixelWiseLoss3D(loss_type, p, reduce_dims)
 
 
 @register_multifield_loss("gradient")
@@ -286,6 +336,15 @@ class MultiFieldGradientLoss(BaseMultiFieldLoss3D):
         super().__init__(**kwargs)
         grad_loss = SpatialGradientLoss3D(filter_type, loss_type, reduce_dims)
         self.loss_fn = lambda x, y: grad_loss(x, y)
+
+
+@register_multifield_loss("ssim")
+class MultiFieldSSIMLoss(BaseMultiFieldLoss3D):
+    def __init__(self, window_size=7, max_val=1.0, reduction='mean', **kwargs):
+        super().__init__(**kwargs)
+        self.loss_fn = lambda x, y: kornia.losses.ssim3d_loss(
+            x, y, window_size=window_size, max_val=max_val, reduction=reduction
+        )
 
 
 @register_multifield_loss("perceptual")
