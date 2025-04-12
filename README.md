@@ -30,7 +30,7 @@ simple_runet/
 
 Run Case1-Train.ipynb for a simple 3D toy example.
 
-(To Do ...) Run Case2-Train.ipynb for a simple 2D toy example.
+Run Case2-Train.ipynb for a simple 2D toy example.
 
 ---
 
