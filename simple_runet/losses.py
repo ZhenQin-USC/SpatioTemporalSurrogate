@@ -327,23 +327,36 @@ class BaseMultiFieldLoss3D(nn.Module):
 class MultiFieldPixelWiseLoss(BaseMultiFieldLoss3D):
     def __init__(self, loss_type='l1', p=2.0, reduce_dims=None, **kwargs):
         super().__init__(**kwargs)
-        self.loss_fn = PixelWiseLoss3D(loss_type, p, reduce_dims)
+        self.pixel_loss = PixelWiseLoss3D(loss_type, p, reduce_dims)
+    
+    def loss_fn(self, x, y):
+        return self.pixel_loss(x, y)
 
 
 @register_multifield_loss("gradient")
 class MultiFieldGradientLoss(BaseMultiFieldLoss3D):
     def __init__(self, filter_type='sobel', loss_type='l1', reduce_dims=None, **kwargs):
         super().__init__(**kwargs)
-        grad_loss = SpatialGradientLoss3D(filter_type, loss_type, reduce_dims)
-        self.loss_fn = lambda x, y: grad_loss(x, y)
+        self.grad_loss = SpatialGradientLoss3D(filter_type, loss_type, reduce_dims)
+
+    def loss_fn(self, x, y):
+        return self.grad_loss(x, y)
 
 
 @register_multifield_loss("ssim")
 class MultiFieldSSIMLoss(BaseMultiFieldLoss3D):
     def __init__(self, window_size=7, max_val=1.0, reduction='mean', **kwargs):
+        self.window_size = window_size
+        self.max_val = max_val
+        self.reduction = reduction
         super().__init__(**kwargs)
-        self.loss_fn = lambda x, y: kornia.losses.ssim3d_loss(
-            x, y, window_size=window_size, max_val=max_val, reduction=reduction
+    
+    def loss_fn(self, x, y):
+        return kornia.losses.ssim3d_loss(
+            x, y, 
+            window_size=self.window_size, 
+            max_val=self.max_val, 
+            reduction=self.reduction
         )
 
 
