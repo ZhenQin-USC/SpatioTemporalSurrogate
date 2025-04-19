@@ -32,7 +32,6 @@ from .trainer import (
     Trainer,
     TrainerCase1,
     TrainerCase2,
-    Trainer_LSDA,
 )
 
 from .utils import (
